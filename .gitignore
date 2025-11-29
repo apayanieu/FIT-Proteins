@@ -1,0 +1,53 @@
+# Byte-compiled / cache files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environments
+.env
+.venv
+env/
+venv/
+fit-proteins/
+condaenv.*
+*.yml~
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+*.egg
+
+# Jupyter
+.ipynb_checkpoints
+
+# IDEs / editors
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+
+# Data & results
+*.csv
+*.tsv
+*.h5
+*.pkl
+*.npy
+*.npz
+outputs/
+results/
+# === Data folders ===
+data/processed/**
+!data/processed/.gitkeep
+
+data/raw/**
+!data/raw/.gitkeep
+
+# Artifacts / arrays
+*.npz
+*.npy
+*.joblib
+
+# Parquet anywhere (optional — comment out if you do want to track some)
+*.parquet

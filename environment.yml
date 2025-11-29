@@ -1,0 +1,136 @@
+name: fit-proteins
+channels:
+  - conda-forge
+channel_priority: strict
+
+dependencies:
+  # ---- Core Python ----
+  - python=3.10
+  - pip>=24.0
+  - setuptools>=70
+  - wheel>=0.43
+
+  # ---- Data Science Stack ----
+  - numpy>=2.0
+  - pandas>=2.2
+  - scipy>=1.13
+  - scikit-learn>=1.5
+  - statsmodels>=0.14
+  - sympy>=1.12
+  - joblib>=1.4
+  - tqdm>=4.66
+
+  # ---- Chemistry & Molecules ----
+  - rdkit>=2023.9
+  - openbabel>=3.1
+  - biopython>=1.83
+  - mordred>=1.2
+  - chembl_webresource_client>=0.10
+
+  # ---- ML / Gradient Boosting (conda builds are stable) ----
+  - lightgbm>=4.5
+  - xgboost>=2.1
+  - catboost>=1.2
+  - shap>=0.44
+  - optuna>=3.6
+  - imbalanced-learn>=0.12
+
+  # ---- Data & File Formats ----
+  - pyarrow>=16
+  - fastparquet>=2024.5
+  - openpyxl>=3.1
+  - h5py>=3.11
+  - xlrd>=2.0
+  - lxml>=5.2
+
+  # ---- Visualization ----
+  - matplotlib>=3.8
+  - seaborn>=0.13
+  - bokeh>=3.5
+  - altair>=5.4
+  - colorcet>=3.0
+  - graphviz
+  - python-graphviz
+  - networkx>=3.3
+  - umap-learn>=0.5
+  - pillow>=10.3
+  - imageio>=2.35
+  - scikit-image>=0.24
+
+  # ---- Notebook / Development ----
+  - jupyterlab>=4.2
+  - ipykernel>=6.29
+  - ipywidgets>=8.1
+  - nbformat>=5.10
+  - nbconvert>=7.16
+  - jupytext>=1.16
+  - papermill>=2.6
+  - line_profiler
+  - memory_profiler
+  - snakeviz
+
+  # ---- Code Quality & Automation ----
+  - black>=24.10
+  - ruff>=0.6
+  - mypy>=1.13
+  - isort>=5.13
+  - pre-commit>=3.8
+  - flake8>=7.1
+  - pylint>=3.2
+
+  # ---- Testing ----
+  - pytest>=8.3
+  - pytest-cov>=5.0
+  - hypothesis>=6.111
+
+  # ---- Experiment Tracking / MLOps ----
+  - mlflow>=2.16
+  - rich>=13.8
+  - typer>=0.12
+  - click>=8.1
+  - requests>=2.32
+  - httpx>=0.27
+  - pyyaml>=6.0
+  - jsonschema>=4.23
+  - tomli>=2.0
+  - tabulate>=0.9
+  - humanfriendly>=10.0
+  - colorama>=0.4
+  - loguru>=0.7
+
+  # ---- PIP extras (installed via pip to avoid conda conflicts) ----
+  - pip:
+      # Deep learning (CPU wheels)
+      - torch>=2.2
+      - torchvision
+      - torchaudio
+      # Viz/export & notebook helpers
+      - plotly>=5.23
+      - kaleido>=0.2
+      - pyvis>=0.3
+      - pandas-profiling>=3.6
+      # Web & apps
+      - gradio>=4.40
+      - fastapi>=0.115
+      - uvicorn>=0.30
+      - streamlit>=1.39
+      # Tracking / MLOps (pip extras are easier)
+      - wandb>=0.18
+      - dvc[gs,s3,azure]>=3.52
+      # Chemistry / ML chemistry (pip preferred)
+      - py3dmol>=2.0.0
+      - deepchem>=2.8
+      - chemprop
+      - mordredcommunity>=1.3
+      - pytdc>=0.4.1
+      # Torch ecosystem
+      - torchmetrics>=1.4
+      - captum>=0.7
+      - torchviz>=0.0.2
+      # DX
+      - great-expectations>=1.1
+      - nbstripout>=0.7
+      - watermark>=2.4
+      - openai>=1.42
+      - jupyterlab-vim
+

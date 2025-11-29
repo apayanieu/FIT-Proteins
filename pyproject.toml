@@ -1,0 +1,156 @@
+[build-system]
+requires = ["setuptools>=70", "setuptools_scm>=8", "wheel>=0.43"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fit-proteins"
+dynamic = ["version"]
+description = "F.I.T Proteins: Fast Inference of Therapeutic PROTEIN–Ligand Interactions for Oncology and Beyond"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [{ name = "Machine Learning & Communication Skills @ IE University" }]
+keywords = ["bioinformatics","drug-discovery","proteins","ligand","machine-learning"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Intended Audience :: Science/Research",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+# Keep core lightweight; conda resolves versions.
+dependencies = [
+  "numpy>=2.0",
+  "pandas>=2.2",
+  "scikit-learn>=1.5",
+  "scipy>=1.11",
+  "pyyaml>=6",
+  "joblib>=1.3",
+  "tqdm>=4.66",
+]
+
+[project.optional-dependencies]
+# ---- Use these with pip ONLY if you're not in the conda env. Prefer conda for CUDA/chemistry. ----
+# Chemistry / molecules (conda-first). 'rdkit-pypi' exists on PyPI but may lag features.
+chem = [
+  "biopython>=1.83",
+  "mordredcommunity>=1.3",
+  "chembl_webresource_client>=0.10",
+  "py3dmol>=2.0.0",
+  # For pip-only installs (no conda), consider:
+  # "rdkit-pypi>=2022.9.5",
+  # "openbabel-wheel>=3.1"  # community wheels; availability may vary
+]
+
+# Gradient boosted trees and friends
+gbm = ["xgboost>=2.0", "lightgbm>=4.0", "catboost>=1.2"]
+
+# Deep learning (conda recommended due to CUDA)
+dl = [
+  "torch>=2.2; platform_system != 'Windows' or platform_machine != 'arm64'",  # hint only
+  "torchvision",
+  "torchaudio",
+  "torchmetrics>=1.4",
+  "captum>=0.7",
+  "torchviz>=0.0.2",
+]
+
+# Viz stacks
+viz = ["matplotlib>=3.8","seaborn>=0.13","plotly>=5.20","bokeh>=3.5","altair>=5.0","kaleido>=0.2","colorcet>=3.0"]
+
+# Data & formats
+io = ["pyarrow>=14","fastparquet>=2024.5","openpyxl>=3.1","h5py>=3.10","lxml>=5.0","xlrd>=2.0"]
+
+# Imaging / graphs / dim-red
+imaging = ["pillow>=10.0","imageio>=2.34","scikit-image>=0.24","networkx>=3.2","pyvis>=0.3","umap-learn>=0.5","graphviz"]
+
+# Experiment tracking / MLOps
+mlops = ["mlflow>=2.10","wandb>=0.18","dvc>=3.0","hydra-core>=1.3","rich>=13.0","typer>=0.12","click>=8.1"]
+
+# Hyperparam & validation
+tuning = ["optuna>=3.5","scikit-optimize>=0.10","imbalanced-learn>=0.12"]
+
+# Data APIs / utils
+utils = ["requests>=2.31","httpx>=0.27","jsonschema>=4.23","tabulate>=0.9","humanfriendly>=10.0","colorama>=0.4","loguru>=0.7"]
+
+# Notebooks
+notebooks = ["jupyterlab>=4.0","ipykernel>=6.0","ipywidgets>=8.0","nbformat>=5.9","nbconvert>=7.0","jupytext>=1.16","papermill>=2.6","watermark>=2.4"]
+
+# Web apps
+apps = ["gradio>=4.40","fastapi>=0.115","uvicorn>=0.30","streamlit>=1.35"]
+
+# Datasets / domain
+datasets = ["pytdc>=0.4.1","deepchem>=2.8","chemprop"]  # deepchem/chemprop: conda preferred
+
+# Dev tooling
+dev = [
+  "black>=24.10",
+  "ruff>=0.6",
+  "mypy>=1.11",
+  "isort>=5.13",
+  "flake8>=7.0",
+  "pylint>=3.2",
+  "pre-commit>=3.8",
+  "pytest>=8",
+  "pytest-cov>=5",
+  "hypothesis>=6.90",
+  "build>=1.2",
+  "twine>=5.0",
+  "setuptools-scm>=8.0",
+  "nbstripout>=0.7",
+]
+
+docs = ["mkdocs>=1.6","mkdocs-material>=9.5","mkdocstrings[python]>=0.25"]
+
+[project.scripts]
+fit-proteins = "fit_proteins.__main__:main"
+
+[project.urls]
+Homepage = "https://example.com/fit-proteins"
+Issues = "https://example.com/fit-proteins/issues"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["fit_proteins*"]
+
+[tool.setuptools.package-data]
+"fit_proteins" = ["**/*.yaml", "**/*.yml", "**/*.json", "**/*.txt", "**/*.pkl", "py.typed"]
+
+
+[tool.setuptools_scm]
+version_scheme = "release-branch-semver"
+local_scheme = "no-local-version"
+write_to = "src/fit_proteins/_version.py"
+
+# ---------- Tooling ----------
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+extend-exclude = ["data/**","artifacts/**"]
+
+[tool.ruff.lint]
+select = ["E","F","I","UP","B"]
+ignore = ["E203"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+ignore_missing_imports = true
+mypy_path = "src"
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+addopts = "-q --cov=fit_proteins --cov-report=term-missing"
+testpaths = ["tests"]
+
+[tool.coverage.run]
+branch = true
+source = ["fit_proteins"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
