@@ -27,13 +27,13 @@ ensuring that the final Random Forest model is ready for BRD4 test-set predictio
 """
 
 # ============================================================
-# RANDOM FOREST WITH BLOCK-AWARE SPLIT AND FINAL FULL TRAINING
+# RANDOM FOREST USING PRE-SPLIT ECFP DATA (TRAIN/VAL_OOD/TEST_OOD)
 # ============================================================
 
 import numpy as np
 import pandas as pd
 from pathlib import Path
-from scipy.sparse import load_npz
+from scipy.sparse import load_npz, vstack  # vstack to combine sparse matrices
 
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import average_precision_score, roc_auc_score
@@ -51,64 +51,45 @@ def ensure_exists(path):
     if not Path(path).exists():
         raise FileNotFoundError(
             f"Required file not found: {path!s}."
-            "Place files under data/processed or correct the path."
+            " Place files under data/processed or correct the path."
         )
 
-# File paths
-X_train_full_fp = DATA_DIR / "X_train_full.npz"
-X_test_fp       = DATA_DIR / "X_test.npz"
-y_train_fp      = DATA_DIR / "y_train_full.npy"
-ids_train_fp    = DATA_DIR / "ids_train_full.npy"
-ids_test_fp     = DATA_DIR / "ids_test.npy"
-splits_fp       = DATA_DIR / "train_brd4_50k_clean_blocks.parquet"
+# Pre-split ECFP files (all in the same folder as this script expects)
+X_train_in_fp   = DATA_DIR / "X_train_in_ecfp.npz"
+y_train_in_fp   = DATA_DIR / "y_train_in.npy"
 
-for p in (X_train_full_fp, X_test_fp, y_train_fp, ids_train_fp, ids_test_fp, splits_fp):
+X_val_ood_fp    = DATA_DIR / "X_val_ood_ecfp.npz"
+y_val_ood_fp    = DATA_DIR / "y_val_ood.npy"
+
+X_test_ood_fp   = DATA_DIR / "X_test_ood_ecfp.npz"
+y_test_ood_fp   = DATA_DIR / "y_test_ood.npy"
+
+for p in (X_train_in_fp, y_train_in_fp,
+          X_val_ood_fp,  y_val_ood_fp,
+          X_test_ood_fp, y_test_ood_fp):
     ensure_exists(p)
 
 # -------------------------------------------
-# LOAD DATA & SPLIT METADATA
+# LOAD PRE-SPLIT DATA
 # -------------------------------------------
-X_train_full = load_npz(X_train_full_fp)
-X_test       = load_npz(X_test_fp)
+X_tr   = load_npz(X_train_in_fp)     # train_in ECFP fingerprints
+y_tr   = np.load(y_train_in_fp)
 
-y_train_full   = np.load(y_train_fp)
-ids_train_full = np.load(ids_train_fp)
-ids_test       = np.load(ids_test_fp)
+X_val  = load_npz(X_val_ood_fp)      # val_ood ECFP fingerprints
+y_val  = np.load(y_val_ood_fp)
 
-splits_df = pd.read_parquet(splits_fp)
+X_test = load_npz(X_test_ood_fp)     # test_ood ECFP fingerprints
+y_test = np.load(y_test_ood_fp)
 
-print("X_train_full shape:", X_train_full.shape)
-print("X_test shape:", X_test.shape)
-print("y_train_full shape:", y_train_full.shape)
-print("ids_train_full shape:", ids_train_full.shape)
-print("ids_test shape:", ids_test.shape)
-print("Splits columns:", splits_df.columns.tolist())
+print("Train_in shape:", X_tr.shape,  "| Positives:", int(y_tr.sum()))
+print("Val_ood  shape:", X_val.shape, "| Positives:", int(y_val.sum()))
+print("Test_ood shape:", X_test.shape,"| Positives:", int(y_test.sum()))
 
 # -------------------------------------------
-# APPLY THE OFFICIAL BLOCK-AWARE SPLIT
-# -------------------------------------------
-df = pd.DataFrame({"id": ids_train_full})
-df = df.merge(splits_df[["id", "split_group"]], on="id", how="left")
-
-train_mask = df["split_group"] == "train_in"
-val_mask   = df["split_group"] == "val_ood"
-
-# train_in split → used for initial training
-X_tr = X_train_full[train_mask.values]
-y_tr = y_train_full[train_mask.values]
-
-# val_ood split → used ONLY for evaluation (never for training)
-X_val = X_train_full[val_mask.values]
-y_val = y_train_full[val_mask.values]
-
-print("Train_in shape:", X_tr.shape, " | Positives:", y_tr.sum())
-print("Val_ood shape:", X_val.shape, " | Positives:", y_val.sum())
-
-# -------------------------------------------
-# STEP 1 — TRAIN ON train_in (for validation evaluation)
+# STEP 1 — TRAIN RF ON train_in ONLY (EVAL ON val_ood)
 # -------------------------------------------
 rf_clf = RandomForestClassifier(
-    n_estimators=250,
+    n_estimators=500,
     max_features="sqrt",
     max_depth=None,
     min_samples_leaf=5,
@@ -120,23 +101,26 @@ rf_clf = RandomForestClassifier(
 rf_clf.fit(X_tr, y_tr)
 print("Random Forest trained on train_in.")
 
-# -------------------------------------------
-# STEP 2 — EVALUATE ON val_ood (UNSEEN DATA)
-# -------------------------------------------
+# ----- Validation on val_ood -----
 val_proba_rf = rf_clf.predict_proba(X_val)[:, 1]
 
-ap_val_rf = average_precision_score(y_val, val_proba_rf)
+ap_val_rf  = average_precision_score(y_val, val_proba_rf)
 roc_val_rf = roc_auc_score(y_val, val_proba_rf)
 
 print(f"RF – Val_OOD AP:  {ap_val_rf:.6f}")
 print(f"RF – Val_OOD AUC: {roc_val_rf:.6f}")
 
 # ---------------------------------------------------------
-# STEP 3 — RETRAIN ON *ALL* TRAINING DATA (train_in + val_ood)
+# STEP 2 — RETRAIN ON TRAIN + VAL (train_in + val_ood)
 # ---------------------------------------------------------
-# This model will be used to predict X_test for Kaggle submission.
+X_train_all = vstack([X_tr, X_val])
+y_train_all = np.concatenate([y_tr, y_val])
+
+print("Combined TRAIN (train_in + val_ood) shape:",
+      X_train_all.shape, "| Positives:", int(y_train_all.sum()))
+
 rf_final = RandomForestClassifier(
-    n_estimators=250,
+    n_estimators=500,
     max_features="sqrt",
     max_depth=None,
     min_samples_leaf=5,
@@ -145,5 +129,16 @@ rf_final = RandomForestClassifier(
     random_state=RANDOM_STATE,
 )
 
-rf_final.fit(X_train_full, y_train_full)
-print("Random Forest retrained on FULL training set.")
+rf_final.fit(X_train_all, y_train_all)
+print("Random Forest retrained on TRAIN + VAL (train_in + val_ood).")
+
+# -------------------------------------------
+# STEP 3 — TEST ON test_ood
+# -------------------------------------------
+test_proba_rf = rf_final.predict_proba(X_test)[:, 1]
+
+ap_test_rf  = average_precision_score(y_test, test_proba_rf)
+roc_test_rf = roc_auc_score(y_test, test_proba_rf)
+
+print(f"RF – Test_OOD AP:  {ap_test_rf:.6f}")
+print(f"RF – Test_OOD AUC: {roc_test_rf:.6f}")

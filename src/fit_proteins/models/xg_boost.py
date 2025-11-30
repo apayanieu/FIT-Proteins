@@ -28,14 +28,14 @@ and ensures no leakage between training and OOD validation.
 """
 
 # ============================================================
-# XGBOOST WITH OFFICIAL BLOCK-AWARE TRAIN/VAL SPLIT + FULL RETRAIN
+# XGBOOST USING PRE-SPLIT ECFP DATA (TRAIN_IN / VAL_OOD / TEST_OOD)
 # ============================================================
 
 import numpy as np
 import pandas as pd
 from pathlib import Path
 
-from scipy.sparse import load_npz
+from scipy.sparse import load_npz, vstack
 import xgboost as xgb
 from sklearn.metrics import average_precision_score, roc_auc_score
 
@@ -55,53 +55,39 @@ def ensure_exists(path):
             "Place it under data/processed or update the path."
         )
 
-X_train_full_fp = DATA_DIR / "X_train_full.npz"
-X_test_fp       = DATA_DIR / "X_test.npz"
-y_train_fp      = DATA_DIR / "y_train_full.npy"
-ids_train_fp    = DATA_DIR / "ids_train_full.npy"
-ids_test_fp     = DATA_DIR / "ids_test.npy"
-splits_fp       = DATA_DIR / "train_brd4_50k_clean_blocks.parquet"
+# Pre-split ECFP files (all in the same folder)
+X_train_in_fp = DATA_DIR / "X_train_in_ecfp.npz"
+y_train_in_fp = DATA_DIR / "y_train_in.npy"
 
-for p in (X_train_full_fp, X_test_fp, y_train_fp, ids_train_fp, ids_test_fp, splits_fp):
+X_val_ood_fp  = DATA_DIR / "X_val_ood_ecfp.npz"
+y_val_ood_fp  = DATA_DIR / "y_val_ood.npy"
+
+X_test_ood_fp = DATA_DIR / "X_test_ood_ecfp.npz"
+y_test_ood_fp = DATA_DIR / "y_test_ood.npy"
+
+for p in (X_train_in_fp, y_train_in_fp,
+          X_val_ood_fp,  y_val_ood_fp,
+          X_test_ood_fp, y_test_ood_fp):
     ensure_exists(p)
 
 # -------------------------------------------
-# LOAD FEATURES, LABELS, IDS, AND SPLIT METADATA
+# LOAD PRE-SPLIT DATA
 # -------------------------------------------
-X_train_full = load_npz(X_train_full_fp)
-X_test       = load_npz(X_test_fp)
+X_tr   = load_npz(X_train_in_fp)   # train_in fingerprints
+y_tr   = np.load(y_train_in_fp)
 
-y_train_full   = np.load(y_train_fp)
-ids_train_full = np.load(ids_train_fp)
-ids_test       = np.load(ids_test_fp)
+X_val  = load_npz(X_val_ood_fp)    # val_ood fingerprints
+y_val  = np.load(y_val_ood_fp)
 
-splits_df = pd.read_parquet(splits_fp)
+X_test = load_npz(X_test_ood_fp)   # test_ood fingerprints
+y_test = np.load(y_test_ood_fp)
 
-print("X_train_full:", X_train_full.shape)
-print("X_test:", X_test.shape)
-print("y_train_full:", y_train_full.shape)
-print("splits columns:", splits_df.columns.tolist())
-
-# -------------------------------------------
-# APPLY OFFICIAL BLOCK-AWARE SPLIT
-# -------------------------------------------
-df = pd.DataFrame({"id": ids_train_full})
-df = df.merge(splits_df[["id", "split_group"]], on="id", how="left")
-
-train_mask = df["split_group"] == "train_in"
-val_mask   = df["split_group"] == "val_ood"
-
-X_tr = X_train_full[train_mask.values]
-y_tr = y_train_full[train_mask.values]
-
-X_val = X_train_full[val_mask.values]
-y_val = y_train_full[val_mask.values]
-
-print("train_in:", X_tr.shape, "| positives:", y_tr.sum())
-print("val_ood:", X_val.shape, "| positives:", y_val.sum())
+print("Train_in shape:", X_tr.shape,  "| Positives:", int(y_tr.sum()))
+print("Val_ood  shape:", X_val.shape, "| Positives:", int(y_val.sum()))
+print("Test_ood shape:", X_test.shape,"| Positives:", int(y_test.sum()))
 
 # -------------------------------------------
-# CLASS IMBALANCE WEIGHT (REQUIRED FOR XGBOOST)
+# CLASS IMBALANCE WEIGHT (FROM train_in)
 # -------------------------------------------
 N_pos = int((y_tr == 1).sum())
 N_neg = int((y_tr == 0).sum())
@@ -110,12 +96,12 @@ scale_pos_weight = N_neg / N_pos
 print("scale_pos_weight (train_in):", scale_pos_weight)
 
 # -------------------------------------------
-# STEP 1 — TRAIN XGBOOST ON train_in ONLY
+# STEP 1 — TRAIN XGBOOST ON train_in ONLY (for val_ood evaluation)
 # -------------------------------------------
 xgb_clf = xgb.XGBClassifier(
     objective="binary:logistic",
     tree_method="hist",
-    n_estimators=500,
+    n_estimators=250,
     learning_rate=0.05,
     max_depth=7,
     subsample=0.8,
@@ -131,9 +117,7 @@ xgb_clf = xgb.XGBClassifier(
 xgb_clf.fit(X_tr, y_tr)
 print("XGBoost trained on train_in.")
 
-# -------------------------------------------
-# STEP 2 — VALIDATE ON val_ood (UNSEEN BUILDING BLOCKS)
-# -------------------------------------------
+# ----- Validation on val_ood -----
 val_proba_xgb = xgb_clf.predict_proba(X_val)[:, 1]
 
 ap_val_xgb  = average_precision_score(y_val, val_proba_xgb)
@@ -143,9 +127,14 @@ print(f"XGBoost – Val_OOD AP:  {ap_val_xgb:.6f}")
 print(f"XGBoost – Val_OOD AUC: {roc_val_xgb:.6f}")
 
 # ---------------------------------------------------------
-# STEP 3 — RETRAIN XGBOOST ON ALL DATA (train_in + val_ood)
+# STEP 2 — RETRAIN ON TRAIN + VAL (train_in + val_ood)
 # ---------------------------------------------------------
-# This final model will then be used for predicting X_test.
+X_train_all = vstack([X_tr, X_val])
+y_train_all = np.concatenate([y_tr, y_val])
+
+print("Combined TRAIN (train_in + val_ood) shape:",
+      X_train_all.shape, "| Positives:", int(y_train_all.sum()))
+
 xgb_final = xgb.XGBClassifier(
     objective="binary:logistic",
     tree_method="hist",
@@ -154,7 +143,7 @@ xgb_final = xgb.XGBClassifier(
     max_depth=7,
     subsample=0.8,
     colsample_bytree=0.6,
-    scale_pos_weight=scale_pos_weight,   # still computed from train_in
+    scale_pos_weight=scale_pos_weight,  # still based on train_in
     reg_lambda=1.0,
     reg_alpha=0.0,
     n_jobs=-1,
@@ -162,5 +151,16 @@ xgb_final = xgb.XGBClassifier(
     eval_metric="aucpr"
 )
 
-xgb_final.fit(X_train_full, y_train_full)
-print("XGBoost retrained on FULL training set.")
+xgb_final.fit(X_train_all, y_train_all)
+print("XGBoost retrained on TRAIN + VAL (train_in + val_ood).")
+
+# -------------------------------------------
+# STEP 3 — TEST ON test_ood
+# -------------------------------------------
+test_proba_xgb = xgb_final.predict_proba(X_test)[:, 1]
+
+ap_test_xgb  = average_precision_score(y_test, test_proba_xgb)
+roc_test_xgb = roc_auc_score(y_test, test_proba_xgb)
+
+print(f"XGBoost – Test_OOD AP:  {ap_test_xgb:.6f}")
+print(f"XGBoost – Test_OOD AUC: {roc_test_xgb:.6f}")
