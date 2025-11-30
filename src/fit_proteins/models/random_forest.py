@@ -4,6 +4,7 @@ import os
 
 from pathlib import Path
 from scipy.sparse import load_npz
+from sklearn.model_selection import train_test_split
 
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import average_precision_score, roc_auc_score
@@ -48,42 +49,34 @@ print("ids_train_full shape:", ids_train_full.shape)
 print("ids_test shape:", ids_test.shape)
 print("Splits columns:", splits_df.columns.tolist())
 
+X_tr, X_val, y_tr, y_val = train_test_split(
+    X_train_full,
+    y_train_full,
+    test_size=0.20,         # 20% validation
+    random_state=RANDOM_STATE,
+    stratify=y_train_full   # keeps the same class ratio
+)
+
+print("Train shape:", X_tr.shape, " | Positives:", y_tr.sum())
+print("Val   shape:", X_val.shape, " | Positives:", y_val.sum())
+
 rf_clf = RandomForestClassifier(
-    n_estimators=200,     # number of trees
-    max_features="sqrt",  # √d (correct parameter, not max_depth)
-    max_depth=None,       # fully grown trees; you can set e.g. 20 if too slow
+    n_estimators=250,
+    max_features="sqrt",
+    max_depth=None,
     min_samples_leaf=5,
     n_jobs=-1,
     class_weight="balanced",
-    random_state=42,
+    random_state=RANDOM_STATE,
 )
 
-# 🔥 TRAIN ONLY ON TRAINING FILES
-rf_clf.fit(X_train_full, y_train_full)
+rf_clf.fit(X_tr, y_tr)
+print("Random Forest trained.")
+#Validation
+val_proba_rf = rf_clf.predict_proba(X_val)[:, 1]
 
-print("Random Forest training complete.")
+ap_val_rf = average_precision_score(y_val, val_proba_rf)
+roc_val_rf = roc_auc_score(y_val, val_proba_rf)
 
-train_proba = rf_clf.predict_proba(X_train_full)[:, 1]
-
-ap_train = average_precision_score(y_train_full, train_proba)
-roc_train = roc_auc_score(y_train_full, train_proba)
-
-print(f"Random Forest – TRAIN AP:  {ap_train:.6f}")
-print(f"Random Forest – TRAIN AUC: {roc_train:.6f}")
-# 🔍 PREDICT ON TEST FILE (X_test)
-test_proba = xgb_clf.predict_proba(X_test)[:, 1]
-
-submission = pd.DataFrame({
-    "id": ids_test,
-    "binds": test_proba.astype(float),
-})
-
-# Create submission directory if it doesn't exist
-submission_dir = Path("../../../data/submission_of_models")
-submission_dir.mkdir(parents=True, exist_ok=True)
-
-submission_path = submission_dir / "submission_xgb_fulltrain.csv"
-submission.to_csv(submission_path, index=False)
-
-print(f"Submission saved to: {submission_path}")
-submission.head()
+print(f"RF – Validation AP:  {ap_val_rf:.6f}")
+print(f"RF – Validation AUC: {roc_val_rf:.6f}")

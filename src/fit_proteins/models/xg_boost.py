@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 from scipy import sparse
 from scipy.sparse import load_npz
+from sklearn.model_selection import train_test_split
 
 import xgboost as xgb
 from sklearn.metrics import average_precision_score, roc_auc_score
@@ -47,12 +48,19 @@ scale_pos_weight = N_neg / N_pos
 print(f"N_pos (train): {N_pos}")
 print(f"N_neg (train): {N_neg}")
 print(f"scale_pos_weight = N_neg / N_pos = {scale_pos_weight:.2f}")
+X_tr, X_val, y_tr, y_val = train_test_split(
+    X_train_full,
+    y_train_full,
+    test_size=0.20,         # 20% validation
+    random_state=RANDOM_STATE,
+    stratify=y_train_full   # keeps the same class ratio
+)
 xgb_clf = xgb.XGBClassifier(
     objective="binary:logistic",
-    tree_method="hist",      # fast for sparse, high-dimensional data
-    n_estimators=225,       # fixed number of trees (no early stopping)
+    tree_method="hist",
+    n_estimators=500,
     learning_rate=0.05,
-    max_depth=7,             # between 6–8 as per your instructions
+    max_depth=7,          # 6 to 8 recommended
     subsample=0.8,
     colsample_bytree=0.6,
     scale_pos_weight=scale_pos_weight,
@@ -60,34 +68,15 @@ xgb_clf = xgb.XGBClassifier(
     reg_alpha=0.0,
     n_jobs=-1,
     random_state=RANDOM_STATE,
-    eval_metric="aucpr",     # metric used during training (for logging only)
+    eval_metric="aucpr"
 )
 
-# 🔥 TRAIN ONLY ON TRAIN FILES
-xgb_clf.fit(X_train_full, y_train_full)
+xgb_clf.fit(X_tr, y_tr)
+print("XGBoost trained.")
+val_proba_xgb = xgb_clf.predict_proba(X_val)[:, 1]
 
-print("XGBoost training complete.")
-train_proba = xgb_clf.predict_proba(X_train_full)[:, 1]
+ap_val_xgb = average_precision_score(y_val, val_proba_xgb)
+roc_val_xgb = roc_auc_score(y_val, val_proba_xgb)
 
-ap_train = average_precision_score(y_train_full, train_proba)
-roc_train = roc_auc_score(y_train_full, train_proba)
-
-print(f"XGBoost – TRAIN AP:  {ap_train:.6f}")
-print(f"XGBoost – TRAIN AUC: {roc_train:.6f}")
-# 🔍 PREDICT ON TEST FILE (X_test)
-test_proba = xgb_clf.predict_proba(X_test)[:, 1]
-
-submission = pd.DataFrame({
-    "id": ids_test,
-    "binds": test_proba.astype(float),
-})
-
-# Create submission directory if it doesn't exist
-submission_dir = Path("../../../data/submission_of_models")
-submission_dir.mkdir(parents=True, exist_ok=True)
-
-submission_path = submission_dir / "submission_xgb_fulltrain.csv"
-submission.to_csv(submission_path, index=False)
-
-print(f"Submission saved to: {submission_path}")
-submission.head()
+print(f"XGBoost – Validation AP:  {ap_val_xgb:.6f}")
+print(f"XGBoost – Validation AUC: {roc_val_xgb:.6f}")
