@@ -1,86 +1,75 @@
 from __future__ import annotations
 
 """
-Step 3: Feature generation (ECFP baseline) for BELKA–BRD4.
+Step 3: ECFP feature generation for internal OOD splits (train_in / val_ood / test_ood).
 
-What this script does
----------------------
-1) Read block-processed chemistry files:
-     data/processed/train_brd4_50k_clean_blocks.parquet
-     data/processed/test_brd4_50k_clean_blocks.parquet
+Inputs (default paths match chemistry_pipeline.py outputs):
+  data/processed/train_brd4_50k_clean_blocks_train.parquet
+  data/processed/train_brd4_50k_clean_blocks_val.parquet
+  data/processed/train_brd4_50k_clean_blocks_test.parquet
 
-2) Compute Morgan/ECFP fingerprints on `smiles_clean` with:
-     - radius = 2
-     - n_bits = 2048
-     - use_chirality = True
+Features:
+  - Morgan/ECFP on 'smiles_clean'
+  - radius=2, n_bits=2048, use_chirality=True (configurable)
 
-3) Persist artifacts for modeling:
-     - X_train_full.npz  (CSR sparse matrix, 50k x 2048)
-     - X_test.npz        (CSR sparse matrix, 50k x 2048)
-     - y_train_full.npy  (binds labels)
-     - ids_train_full.npy
-     - ids_test.npy
-     - prep_metadata.joblib (fingerprint parameters + sources)
+Outputs (easy, unambiguous names):
+  X_train_in_ecfp.npz   y_train_in.npy   ids_train_in.npy
+  X_val_ood_ecfp.npz    y_val_ood.npy    ids_val_ood.npy
+  X_test_ood_ecfp.npz   y_test_ood.npy   ids_test_ood.npy
+  ecfp_metadata.joblib
 
-4) Run sanity checks:
-     - Check shapes and alignment of all arrays
-     - Check class balance (positive rate) in y_train_full
-     - Check fingerprint sparsity (avg bits=1 per molecule, random rows)
-     - OPTIONAL: quick RandomForest sanity AP (if scikit-learn is installed)
-
-You can re-run this script safely; it overwrites outputs.
+This script overwrites outputs on rerun.
 """
 
 import argparse
 from pathlib import Path
-from typing import Optional, Iterable, Dict, Any
+from typing import Iterable, Dict, Any
 
 import joblib
 import numpy as np
 import pandas as pd
-from rdkit import Chem
+from rdkit import Chem, DataStructs
 from rdkit.Chem import AllChem
 from scipy import sparse
 
-
 # --------------------------------------------------------------------------------------
-# Paths & utilities
+# Paths
 # --------------------------------------------------------------------------------------
-
 
 def get_project_root() -> Path:
-    """Compute project root whether run as script or interactively."""
     try:
         return Path(__file__).resolve().parents[1]
     except NameError:
-        # __file__ not defined (e.g., interactive / notebook). Fall back to CWD.
         return Path.cwd()
 
-
-PROJECT_ROOT = get_project_root()
+PROJECT_ROOT  = get_project_root()
 PROCESSED_DIR = PROJECT_ROOT / "data" / "processed"
 PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
 
-# Default IO paths (matched to chemistry_pipeline outputs)
-TRAIN_BLOCKS_IN = PROCESSED_DIR / "train_brd4_50k_clean_blocks.parquet"
-TEST_BLOCKS_IN = PROCESSED_DIR / "test_brd4_50k_clean_blocks.parquet"
+TRAIN_IN_DEFAULT = PROCESSED_DIR / "train_brd4_50k_clean_blocks_train.parquet"
+VAL_IN_DEFAULT   = PROCESSED_DIR / "train_brd4_50k_clean_blocks_val.parquet"
+TEST_IN_DEFAULT  = PROCESSED_DIR / "train_brd4_50k_clean_blocks_test.parquet"
 
-X_TRAIN_OUT = PROCESSED_DIR / "X_train_full.npz"
-X_TEST_OUT = PROCESSED_DIR / "X_test.npz"
-Y_TRAIN_OUT = PROCESSED_DIR / "y_train_full.npy"
-IDS_TRAIN_OUT = PROCESSED_DIR / "ids_train_full.npy"
-IDS_TEST_OUT = PROCESSED_DIR / "ids_test.npy"
-META_OUT = PROCESSED_DIR / "prep_metadata.joblib"
+# Outputs (distinct, readable names)
+X_TRAIN_OUT = PROCESSED_DIR / "X_train_in_ecfp.npz"
+Y_TRAIN_OUT = PROCESSED_DIR / "y_train_in.npy"
+IDS_TRAIN_OUT = PROCESSED_DIR / "ids_train_in.npy"
 
+X_VAL_OUT = PROCESSED_DIR / "X_val_ood_ecfp.npz"
+Y_VAL_OUT = PROCESSED_DIR / "y_val_ood.npy"
+IDS_VAL_OUT = PROCESSED_DIR / "ids_val_ood.npy"
 
-REQUIRED_TRAIN_COLS = {"id", "smiles_clean", "binds"}
-REQUIRED_TEST_COLS = {"id", "smiles_clean"}
+X_TEST_OUT = PROCESSED_DIR / "X_test_ood_ecfp.npz"
+Y_TEST_OUT = PROCESSED_DIR / "y_test_ood.npy"
+IDS_TEST_OUT = PROCESSED_DIR / "ids_test_ood.npy"
 
+META_OUT   = PROCESSED_DIR / "ecfp_metadata.joblib"
+
+REQUIRED_COLS = {"id", "smiles_clean", "binds"}
 
 # --------------------------------------------------------------------------------------
-# Core ECFP helpers
+# ECFP helpers
 # --------------------------------------------------------------------------------------
-
 
 def smiles_to_ecfp(
     smiles: str,
@@ -88,30 +77,19 @@ def smiles_to_ecfp(
     n_bits: int = 2048,
     use_chirality: bool = True,
 ) -> sparse.csr_matrix:
-    """
-    Convert a SMILES string into a 1 x n_bits ECFP fingerprint (CSR row).
-
-    - If RDKit fails to parse, returns an all-zero row.
-    """
+    """Return a 1 x n_bits CSR row; all-zero if SMILES is invalid."""
     if not isinstance(smiles, str):
         return sparse.csr_matrix((1, n_bits), dtype=np.int8)
-
     mol = Chem.MolFromSmiles(smiles)
     if mol is None:
-        # Invalid SMILES -> all zeros; keeps row count aligned
         return sparse.csr_matrix((1, n_bits), dtype=np.int8)
 
     fp = AllChem.GetMorganFingerprintAsBitVect(
-        mol,
-        radius,
-        nBits=n_bits,
-        useChirality=use_chirality,
+        mol, radius, nBits=n_bits, useChirality=use_chirality
     )
-
     arr = np.zeros((1, n_bits), dtype=np.int8)
-    Chem.DataStructs.ConvertToNumpyArray(fp, arr[0])
+    DataStructs.ConvertToNumpyArray(fp, arr[0])
     return sparse.csr_matrix(arr)
-
 
 def compute_ecfp_matrix(
     smiles_list: Iterable[str],
@@ -120,267 +98,164 @@ def compute_ecfp_matrix(
     use_chirality: bool = True,
     verbose: bool = True,
 ) -> sparse.csr_matrix:
-    """
-    Compute a CSR matrix of ECFP fingerprints for a list of SMILES.
-
-    Returns: (n_mols, n_bits) CSR matrix with dtype int8.
-    """
     rows = []
     for i, s in enumerate(smiles_list):
         if verbose and (i + 1) % 5000 == 0:
             print(f"  processed {i + 1} molecules...")
         rows.append(smiles_to_ecfp(s, radius=radius, n_bits=n_bits, use_chirality=use_chirality))
-
     X = sparse.vstack(rows, format="csr")
     X.data = X.data.astype(np.int8, copy=False)
     return X
 
-
 # --------------------------------------------------------------------------------------
-# Sanity checks
+# IO helpers
 # --------------------------------------------------------------------------------------
 
+def load_split(path: Path) -> pd.DataFrame:
+    if not path.exists():
+        raise FileNotFoundError(f"Missing parquet: {path}")
+    df = pd.read_parquet(path)
+    missing = REQUIRED_COLS - set(df.columns)
+    if missing:
+        raise KeyError(f"{path.name} missing columns: {missing}")
+    # enforce dtypes
+    df = df.copy()
+    df["binds"] = df["binds"].astype(int)
+    return df
 
-def run_sanity_checks(
-    X_train: sparse.csr_matrix,
-    X_test: sparse.csr_matrix,
-    y_train: np.ndarray,
-    ids_train: np.ndarray,
-    ids_test: np.ndarray,
+def save_split(
+    X: sparse.csr_matrix, y: np.ndarray, ids: np.ndarray,
+    X_path: Path, y_path: Path, ids_path: Path
 ) -> None:
-    """Print basic sanity checks to stdout."""
-    print("\n================ Sanity checks ================")
+    sparse.save_npz(X_path, X)
+    np.save(y_path, y.astype(np.int8, copy=False))
+    np.save(ids_path, ids)
 
-    # Shape checks
-    print("[shape] X_train:", X_train.shape)
-    print("[shape] X_test :", X_test.shape)
-    print("[shape] y_train:", y_train.shape)
-    print("[shape] ids_train:", ids_train.shape)
-    print("[shape] ids_test :", ids_test.shape)
+# --------------------------------------------------------------------------------------
+# Sanity reporting
+# --------------------------------------------------------------------------------------
 
-    assert X_train.shape[0] == y_train.shape[0] == ids_train.shape[0], \
-        "Row count mismatch between X_train, y_train, ids_train"
-    assert X_test.shape[0] == ids_test.shape[0], \
-        "Row count mismatch between X_test, ids_test"
+def report_split(name: str, X: sparse.csr_matrix, y: np.ndarray) -> None:
+    pos_rate = float(y.mean()) if y.size else float("nan")
+    print(f"[{name}] X shape: {X.shape} | positives: {int(y.sum())}/{len(y)} ({pos_rate:.5f}) "
+          f"| avg bits on: {X.nnz / max(1, X.shape[0]):.1f}")
 
-    # Label distribution
-    pos_rate = float(y_train.mean())
-    n_pos = int(y_train.sum())
-    n_tot = int(y_train.shape[0])
-    print("\n[label] Total train molecules:", n_tot)
-    print("[label] Positives:", n_pos)
-    print("[label] Positive rate:", f"{pos_rate:.4f}")
-
-    # Fingerprint sparsity
-    avg_bits_on_train = X_train.nnz / X_train.shape[0]
-    avg_bits_on_test = X_test.nnz / X_test.shape[0]
-    print("\n[fp] Average #bits=1 per molecule (train):", f"{avg_bits_on_train:.1f}")
-    print("[fp] Average #bits=1 per molecule (test) :", f"{avg_bits_on_test:.1f}")
-
-    rng = np.random.default_rng(42)
-    rows = rng.choice(X_train.shape[0], size=min(5, X_train.shape[0]), replace=False)
-    print("\n[fp] Example rows (train):")
-    for r in rows:
-        n_on = X_train[r].nnz
-        print(f"  row {int(r)}: bits on = {n_on}")
-
-    # Optional: quick RF sanity AP if sklearn installed
+def rf_sanity(train_X, train_y, val_X, val_y) -> None:
+    """Tiny RF check: train on train_in, score AP on val_ood."""
     try:
         from sklearn.ensemble import RandomForestClassifier
         from sklearn.metrics import average_precision_score
-        from sklearn.model_selection import train_test_split
 
-        print("\n[rf] Running quick RandomForest sanity check (this is NOT the final model)...")
-        X_tr, X_val, y_tr, y_val = train_test_split(
-            X_train, y_train,
-            test_size=0.2,
-            random_state=42,
-            stratify=y_train,
-        )
-
+        print("\n[rf] Quick sanity: RF on train_in → AP on val_ood")
         rf = RandomForestClassifier(
-            n_estimators=100,
-            class_weight="balanced",
-            n_jobs=-1,
-            random_state=42,
+            n_estimators=100, class_weight="balanced", n_jobs=-1, random_state=42
         )
-        rf.fit(X_tr, y_tr)
-        val_scores = rf.predict_proba(X_val)[:, 1]
-        ap = average_precision_score(y_val, val_scores)
-        print(f"[rf] Sanity-check AP on random 20% split: {ap:.4f}")
-        print("[rf] (If this is > positive rate, features carry some signal.)")
-    except ImportError:
-        print("\n[rf] sklearn not installed, skipping RF sanity check.")
+        rf.fit(train_X, train_y)
+        proba = rf.predict_proba(val_X)[:, 1]
+        ap = average_precision_score(val_y, proba)
+        print(f"[rf] AP(val_ood) = {ap:.4f} (baseline sanity only)")
     except Exception as e:
-        print("\n[rf] RF sanity check failed with error:")
-        print("    ", repr(e))
-
-    print("============== End sanity checks ==============\n")
-
+        print("[rf] Skipping RF sanity check:", repr(e))
 
 # --------------------------------------------------------------------------------------
 # Orchestrator
 # --------------------------------------------------------------------------------------
 
-
-def run_ecfp(args: argparse.Namespace) -> None:
-    """
-    Orchestrate Step 3: read Parquets, compute ECFP features, save artifacts, run sanity checks.
-    """
+def run(args: argparse.Namespace) -> None:
     radius = args.radius
     n_bits = args.n_bits
     use_chirality = not args.no_chirality
 
-    # Resolve input paths (allow overrides)
-    train_path = Path(args.train_in or TRAIN_BLOCKS_IN)
-    test_path = Path(args.test_in or TEST_BLOCKS_IN)
-
-    print("[read] train:", train_path)
-    print("[read] test :", test_path)
-
-    if not train_path.exists():
-        raise FileNotFoundError(f"Train parquet not found: {train_path}")
-    if not test_path.exists():
-        raise FileNotFoundError(f"Test parquet not found: {test_path}")
-
-    train_df = pd.read_parquet(train_path)
-    test_df = pd.read_parquet(test_path)
-
-    # Basic column checks
-    missing_train = REQUIRED_TRAIN_COLS - set(train_df.columns)
-    missing_test = REQUIRED_TEST_COLS - set(test_df.columns)
-    if missing_train:
-        raise KeyError(f"Train parquet missing required columns: {missing_train}")
-    if missing_test:
-        raise KeyError(f"Test parquet missing required columns: {missing_test}")
-
-    # Extract SMILES, labels, IDs
-    train_smiles = train_df["smiles_clean"].astype(str).tolist()
-    test_smiles = test_df["smiles_clean"].astype(str).tolist()
-
-    y_train = train_df["binds"].astype(int).values
-    ids_train = train_df["id"].values
-    ids_test = test_df["id"].values
-
-    print("\n[ecfp] Parameters:")
-    print(f"  radius       = {radius}")
-    print(f"  n_bits       = {n_bits}")
-    print(f"  use_chirality= {use_chirality}")
-
-    # Compute fingerprints
-    print("\n[ecfp] Computing ECFP for train...")
-    X_train = compute_ecfp_matrix(
-        train_smiles,
-        radius=radius,
-        n_bits=n_bits,
-        use_chirality=use_chirality,
-        verbose=True,
-    )
-
-    print("[ecfp] Computing ECFP for test...")
-    X_test = compute_ecfp_matrix(
-        test_smiles,
-        radius=radius,
-        n_bits=n_bits,
-        use_chirality=use_chirality,
-        verbose=True,
-    )
-
-    # Save artifacts
+    train_p = Path(args.train_in or TRAIN_IN_DEFAULT)
+    val_p   = Path(args.val_in or VAL_IN_DEFAULT)
+    test_p  = Path(args.test_in or TEST_IN_DEFAULT)
     out_dir = Path(args.out_dir or PROCESSED_DIR)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    print("\n[write] Saving feature matrices and arrays to:", out_dir)
-    sparse.save_npz(out_dir / "X_train_full.npz", X_train)
-    sparse.save_npz(out_dir / "X_test.npz", X_test)
+    print("[read]", train_p.name, "|", val_p.name, "|", test_p.name)
+    df_tr = load_split(train_p)
+    df_va = load_split(val_p)
+    df_te = load_split(test_p)
 
-    np.save(out_dir / "y_train_full.npy", y_train)
-    np.save(out_dir / "ids_train_full.npy", ids_train)
-    np.save(out_dir / "ids_test.npy", ids_test)
+    print("\n[ecfp] Parameters:",
+          f"radius={radius}  n_bits={n_bits}  use_chirality={use_chirality}")
+
+    # Compute fingerprints per split
+    print("\n[ecfp] Computing train_in...")
+    X_tr = compute_ecfp_matrix(df_tr["smiles_clean"].astype(str), radius, n_bits, use_chirality, verbose=True)
+    y_tr = df_tr["binds"].to_numpy()
+    ids_tr = df_tr["id"].to_numpy()
+
+    print("[ecfp] Computing val_ood...")
+    X_va = compute_ecfp_matrix(df_va["smiles_clean"].astype(str), radius, n_bits, use_chirality, verbose=True)
+    y_va = df_va["binds"].to_numpy()
+    ids_va = df_va["id"].to_numpy()
+
+    print("[ecfp] Computing test_ood...")
+    X_te = compute_ecfp_matrix(df_te["smiles_clean"].astype(str), radius, n_bits, use_chirality, verbose=True)
+    y_te = df_te["binds"].to_numpy()
+    ids_te = df_te["id"].to_numpy()
+
+    # Save artifacts with clear names
+    print("\n[write] Saving artifacts to:", out_dir)
+    save_split(X_tr, y_tr, ids_tr, out_dir / X_TRAIN_OUT.name, out_dir / Y_TRAIN_OUT.name, out_dir / IDS_TRAIN_OUT.name)
+    save_split(X_va, y_va, ids_va, out_dir / X_VAL_OUT.name,   out_dir / Y_VAL_OUT.name,   out_dir / IDS_VAL_OUT.name)
+    save_split(X_te, y_te, ids_te, out_dir / X_TEST_OUT.name,  out_dir / Y_TEST_OUT.name,  out_dir / IDS_TEST_OUT.name)
 
     # Metadata for reproducibility
     meta: Dict[str, Any] = {
-        "radius": int(radius),
-        "n_bits": int(n_bits),
-        "use_chirality": bool(use_chirality),
-        "train_source": str(train_path.resolve()),
-        "test_source": str(test_path.resolve()),
-        "outputs": {
-            "X_train_full": str((out_dir / "X_train_full.npz").resolve()),
-            "X_test": str((out_dir / "X_test.npz").resolve()),
-            "y_train_full": str((out_dir / "y_train_full.npy").resolve()),
-            "ids_train_full": str((out_dir / "ids_train_full.npy").resolve()),
-            "ids_test": str((out_dir / "ids_test.npy").resolve()),
+        "ecfp": {"radius": int(radius), "n_bits": int(n_bits), "use_chirality": bool(use_chirality)},
+        "sources": {
+            "train_in": str(train_p.resolve()),
+            "val_ood":  str(val_p.resolve()),
+            "test_ood": str(test_p.resolve()),
         },
+        "outputs": {
+            "X_train_in": str((out_dir / X_TRAIN_OUT.name).resolve()),
+            "y_train_in": str((out_dir / Y_TRAIN_OUT.name).resolve()),
+            "ids_train_in": str((out_dir / IDS_TRAIN_OUT.name).resolve()),
+            "X_val_ood": str((out_dir / X_VAL_OUT.name).resolve()),
+            "y_val_ood": str((out_dir / Y_VAL_OUT.name).resolve()),
+            "ids_val_ood": str((out_dir / IDS_VAL_OUT.name).resolve()),
+            "X_test_ood": str((out_dir / X_TEST_OUT.name).resolve()),
+            "y_test_ood": str((out_dir / Y_TEST_OUT.name).resolve()),
+            "ids_test_ood": str((out_dir / IDS_TEST_OUT.name).resolve()),
+        }
     }
-    joblib.dump(meta, out_dir / "prep_metadata.joblib")
-    print("[write] prep_metadata.joblib")
+    joblib.dump(meta, out_dir / META_OUT.name)
+    print("[write]", META_OUT.name)
 
-    # Sanity checks
-    run_sanity_checks(X_train, X_test, y_train, ids_train, ids_test)
-
+    # Sanity summaries
+    print("\n================ Sanity checks ================")
+    report_split("train_in", X_tr, y_tr)
+    report_split("val_ood",  X_va, y_va)
+    report_split("test_ood", X_te, y_te)
+    rf_sanity(X_tr, y_tr, X_va, y_va)
+    print("============== End sanity checks ==============\n")
 
 # --------------------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------------------
 
-
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
-        description="Step 3: ECFP feature generation for BELKA–BRD4."
-    )
-    sub = p.add_subparsers(dest="cmd", required=True)
-
-    pecfp = sub.add_parser(
-        "ecfp",
-        help="Compute ECFP features from *_clean_blocks.parquet and save npz/npy/joblib.",
-    )
-    pecfp.add_argument(
-        "--train-in",
-        dest="train_in",
-        default=None,
-        help="Input train parquet (default: train_brd4_50k_clean_blocks.parquet)",
-    )
-    pecfp.add_argument(
-        "--test-in",
-        dest="test_in",
-        default=None,
-        help="Input test parquet (default: test_brd4_50k_clean_blocks.parquet)",
-    )
-    pecfp.add_argument(
-        "--out-dir",
-        dest="out_dir",
-        default=None,
-        help="Output directory for npz/npy/joblib (default: data/processed)",
-    )
-    pecfp.add_argument(
-        "--radius",
-        type=int,
-        default=2,
-        help="ECFP radius (default: 2)",
-    )
-    pecfp.add_argument(
-        "--n-bits",
-        dest="n_bits",
-        type=int,
-        default=2048,
-        help="Number of bits for ECFP (default: 2048)",
-    )
-    pecfp.add_argument(
-        "--no-chirality",
-        action="store_true",
-        help="Disable useChirality in Morgan fingerprints (default: chirality ON).",
-    )
-    pecfp.set_defaults(func=run_ecfp)
-
+    p = argparse.ArgumentParser(description="ECFP features for block-OOD splits (train_in/val_ood/test_ood).")
+    p.add_argument("--train-in", type=str, default=None,
+                   help="Path to *_clean_blocks_train.parquet")
+    p.add_argument("--val-in",   type=str, default=None,
+                   help="Path to *_clean_blocks_val.parquet")
+    p.add_argument("--test-in",  type=str, default=None,
+                   help="Path to *_clean_blocks_test.parquet")
+    p.add_argument("--out-dir",  type=str, default=None,
+                   help="Output directory (default: data/processed)")
+    p.add_argument("--radius",   type=int, default=2, help="ECFP radius")
+    p.add_argument("--n-bits",   dest="n_bits", type=int, default=2048, help="ECFP bit length")
+    p.add_argument("--no-chirality", action="store_true", help="Disable chirality (default: enabled)")
     return p
 
-
-def main(argv: Optional[list[str]] = None) -> None:
+def main(argv: list[str] | None = None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
-    args.func(args)
-
+    run(args)
 
 if __name__ == "__main__":
     main()
