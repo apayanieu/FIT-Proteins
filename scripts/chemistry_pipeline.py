@@ -1,33 +1,47 @@
 from __future__ import annotations
 
 """
-A single, end-to-end pipeline that processes DEL chemistry data for modeling.
-1) Clean DEL SMILES (replace [Dy] -> [H], canonicalize isomeric SMILES)
-2) Canonicalize building block columns (bb*_smiles -> *_clean)
-3) Mark train rows that share any block with test (shared_block_any)
-4) Make an OOD validation split by holding out a percentage of blocks from TRAIN
-5) Persist processed train/test parquet files and a metadata joblib
+End-to-end pipeline to build an internal OOD benchmark from Kaggle's BRD4 TRAIN only.
+
+Pipeline:
+  1) Clean DEL SMILES (replace [Dy] -> [H], canonicalize isomeric SMILES).
+  2) Canonicalize building block columns (bb*_smiles -> *_clean).
+  3) Partition the universe of unique building blocks into disjoint sets:
+       - TRAIN_BLOCKS
+       - VAL_BLOCKS (held-out for validation OOD)
+       - TEST_BLOCKS (held-out for test OOD)
+     Assignment precedence per molecule: test_ood > val_ood > train_in.
+  4) Persist:
+       - One parquet with all rows and split_group column.
+       - Separate per-split parquets for convenience.
+       - A metadata joblib with block sets and parameters.
 
 Defaults keep your current project layout:
   data/raw/train_brd4_50k_stratified.parquet
-  data/raw/test_brd4_50k.parquet
-  data/processed/{*_clean.parquet, *_clean_blocks.parquet, chemistry_blocks_metadata.joblib}
+  data/processed/train_brd4_50k_clean.parquet
+  data/processed/train_brd4_50k_clean_blocks.parquet
+  data/processed/train_brd4_50k_clean_blocks_{train,val,test}.parquet
+  data/processed/chemistry_blocks_metadata.joblib
 
 CLI examples:
-  python scripts/chemistry_pipeline.py clean                # Step 1 only
-  python scripts/chemistry_pipeline.py blocks               # Steps 2-5 (expects *_clean files exist)
-  python scripts/chemistry_pipeline.py all                  # Run everything end-to-end
-  
-Options:
-  --held-out-pct 0.05    (percentage of TRAIN blocks to hold out into val_ood)
-  --seed 42              (deterministic seed for held-out selection)
+  # Step 1 only: clean SMILES and write *_clean.parquet
+  python scripts/chemistry_pipeline.py clean
 
-This script is safe to run multiple times; it overwrites outputs.
+  # Step 2-4 only: assumes *_clean.parquet exists
+  python scripts/chemistry_pipeline.py split --val-pct 0.08 --test-pct 0.08
+
+  # All steps in sequence
+  python scripts/chemistry_pipeline.py all --val-pct 0.08 --test-pct 0.08 --seed 42
+
+Notes:
+  - val_pct + test_pct must be in (0,1), and val_pct + test_pct < 1.
+  - OOD is defined at block-level: if a molecule contains any held-out block,
+    it belongs to the corresponding OOD split (test first, then val).
 """
 
 import argparse
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Iterable, Optional, Tuple, Set, Dict
 
 import joblib
 import numpy as np
@@ -35,7 +49,7 @@ import pandas as pd
 from rdkit import Chem
 
 # --------------------------------------------------------------------------------------
-# Paths & utilities
+# Paths & constants
 # --------------------------------------------------------------------------------------
 
 def get_project_root() -> Path:
@@ -43,7 +57,6 @@ def get_project_root() -> Path:
     try:
         return Path(__file__).resolve().parents[1]
     except NameError:
-        # __file__ not defined (e.g., in notebooks). Fall back to CWD.
         return Path.cwd()
 
 PROJECT_ROOT = get_project_root()
@@ -51,17 +64,16 @@ RAW_DIR       = PROJECT_ROOT / "data" / "raw"
 PROCESSED_DIR = PROJECT_ROOT / "data" / "processed"
 PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
 
-# Default IO
-TRAIN_IN_RAW = RAW_DIR / "train_brd4_50k_stratified.parquet"
-TEST_IN_RAW  = RAW_DIR / "test_brd4_50k.parquet"
+RAW_TRAIN_IN   = RAW_DIR / "train_brd4_50k_stratified.parquet"
 
-TRAIN_OUT_CLEAN = PROCESSED_DIR / "train_brd4_50k_clean.parquet"
-TEST_OUT_CLEAN  = PROCESSED_DIR / "test_brd4_50k_clean.parquet"
+CLEAN_OUT      = PROCESSED_DIR / "train_brd4_50k_clean.parquet"
+BLOCKS_ALL_OUT = PROCESSED_DIR / "train_brd4_50k_clean_blocks.parquet"
+BLOCKS_TR_OUT  = PROCESSED_DIR / "train_brd4_50k_clean_blocks_train.parquet"
+BLOCKS_VA_OUT  = PROCESSED_DIR / "train_brd4_50k_clean_blocks_val.parquet"
+BLOCKS_TE_OUT  = PROCESSED_DIR / "train_brd4_50k_clean_blocks_test.parquet"
+META_OUT       = PROCESSED_DIR / "chemistry_blocks_metadata.joblib"
 
-TRAIN_OUT_BLOCKS = PROCESSED_DIR / "train_brd4_50k_clean_blocks.parquet"
-TEST_OUT_BLOCKS  = PROCESSED_DIR / "test_brd4_50k_clean_blocks.parquet"
-META_OUT         = PROCESSED_DIR / "chemistry_blocks_metadata.joblib"
-
+# Building block columns in the raw file
 BB_COLS = [
     "buildingblock1_smiles",
     "buildingblock2_smiles",
@@ -69,7 +81,7 @@ BB_COLS = [
 ]
 
 # --------------------------------------------------------------------------------------
-# Core chemistry helpers
+# Chemistry helpers
 # --------------------------------------------------------------------------------------
 
 def clean_smiles(s: str) -> Optional[str]:
@@ -85,6 +97,7 @@ def clean_smiles(s: str) -> Optional[str]:
 
 
 def canon_block(s: str) -> Optional[str]:
+    """Canonicalize a block SMILES to isomeric SMILES; None if invalid."""
     if not isinstance(s, str):
         return None
     mol = Chem.MolFromSmiles(s)
@@ -94,40 +107,159 @@ def canon_block(s: str) -> Optional[str]:
     return Chem.MolToSmiles(mol, isomericSmiles=True)
 
 
-# --------------------------------------------------------------------------------------
-# Step 1: Clean DEL SMILES on train/test
-# --------------------------------------------------------------------------------------
+def ensure_block_clean_cols(df: pd.DataFrame, bb_cols: Iterable[str] = BB_COLS) -> pd.DataFrame:
+    """Make sure *_clean block columns exist; fill them by canonicalizing the originals."""
+    out = df.copy()
+    for c in bb_cols:
+        cc = f"{c}_clean"
+        if cc not in out.columns:
+            if c not in out.columns:
+                out[cc] = None
+            else:
+                out[cc] = out[c].astype(str).map(canon_block)
+    return out
 
-def process_smiles(df: pd.DataFrame) -> pd.DataFrame:
+
+def process_smiles_column(df: pd.DataFrame) -> pd.DataFrame:
+    """Create 'smiles_clean' from 'molecule_smiles'."""
     if "molecule_smiles" not in df.columns:
         raise KeyError("Expected column 'molecule_smiles' in input DataFrame.")
     out = df.copy()
     out["smiles_clean"] = out["molecule_smiles"].astype(str).map(clean_smiles)
     return out
 
+# --------------------------------------------------------------------------------------
+# OOD split logic
+# --------------------------------------------------------------------------------------
+
+def collect_unique_blocks(train: pd.DataFrame, bb_cols: Iterable[str]) -> np.ndarray:
+    """Collect unique non-null cleaned blocks from TRAIN."""
+    bb_clean = [f"{c}_clean" for c in bb_cols]
+    blocks_set = set().union(*[set(pd.Series(train[cc]).dropna().unique()) for cc in bb_clean])
+    blocks = np.array(sorted(list(blocks_set)))
+    if len(blocks) == 0:
+        raise ValueError("No building blocks found in TRAIN to create an OOD split.")
+    return blocks
+
+
+def sample_block_partitions(
+    blocks: np.ndarray,
+    val_pct: float,
+    test_pct: float,
+    seed: int,
+) -> Tuple[Set[str], Set[str], Set[str]]:
+    """
+    Partition block universe into train/val/test sets by sampling disjoint val and test subsets.
+    Remaining blocks are assigned to train.
+    """
+    if not (0 < val_pct < 1) or not (0 < test_pct < 1) or not (val_pct + test_pct < 1):
+        raise ValueError("Require 0 < val_pct, test_pct and val_pct + test_pct < 1.")
+    rng = np.random.default_rng(seed)
+
+    n = len(blocks)
+    n_val = max(1, int(round(val_pct * n)))
+    n_test = max(1, int(round(test_pct * n)))
+
+    # sample VAL
+    val_idx = rng.choice(n, size=n_val, replace=False)
+    val_blocks = set(blocks[val_idx])
+
+    # sample TEST from the remaining
+    remaining_mask = np.ones(n, dtype=bool)
+    remaining_mask[val_idx] = False
+    remaining = blocks[remaining_mask]
+    if len(remaining) < n_test:
+        raise ValueError("Not enough blocks remaining to sample TEST set. Reduce test_pct or val_pct.")
+    test_idx_local = rng.choice(len(remaining), size=n_test, replace=False)
+    test_blocks = set(remaining[test_idx_local])
+
+    train_blocks = set(blocks) - val_blocks - test_blocks
+    return train_blocks, val_blocks, test_blocks
+
+
+def assign_split_groups(
+    df: pd.DataFrame,
+    val_blocks: Set[str],
+    test_blocks: Set[str],
+    bb_cols: Iterable[str],
+) -> pd.DataFrame:
+    """
+    Vectorized split assignment with precedence: test_ood > val_ood > train_in.
+    A molecule goes to OOD if ANY of its blocks is in the held-out set.
+    """
+    bb_clean = [f"{c}_clean" for c in bb_cols]
+    out = df.copy()
+
+    # Boolean masks: does the row contain any val/test block?
+    is_val_any = None
+    is_test_any = None
+    for cc in bb_clean:
+        col = out[cc]
+        val_hit = col.isin(val_blocks)
+        test_hit = col.isin(test_blocks)
+        is_val_any = val_hit if is_val_any is None else (is_val_any | val_hit)
+        is_test_any = test_hit if is_test_any is None else (is_test_any | test_hit)
+
+    out["split_group"] = "train_in"
+    # Assign val first, then test to ensure test overrides val
+    out.loc[is_val_any, "split_group"] = "val_ood"
+    out.loc[is_test_any, "split_group"] = "test_ood"
+    return out
+
+
+def sanity_checks_split(
+    df: pd.DataFrame,
+    train_blocks: Set[str],
+    val_blocks: Set[str],
+    test_blocks: Set[str],
+    bb_cols: Iterable[str],
+) -> Dict[str, int]:
+    """
+    Ensure no held-out blocks leak into train_in.
+    Return row counts per split for convenience.
+    """
+    bb_clean = [f"{c}_clean" for c in bb_cols]
+    # Blocks actually observed in each split
+    blocks_in_train = set()
+    blocks_in_val   = set()
+    blocks_in_test  = set()
+    for cc in bb_clean:
+        blocks_in_train |= set(pd.Series(df.loc[df["split_group"] == "train_in", cc]).dropna().unique())
+        blocks_in_val   |= set(pd.Series(df.loc[df["split_group"] == "val_ood",   cc]).dropna().unique())
+        blocks_in_test  |= set(pd.Series(df.loc[df["split_group"] == "test_ood",  cc]).dropna().unique())
+
+    # No held-out blocks in train_in
+    leak_val = blocks_in_train & val_blocks
+    leak_test = blocks_in_train & test_blocks
+    if leak_val or leak_test:
+        raise AssertionError(
+            f"Leakage detected: train_in contains held-out blocks. "
+            f"val_leaks={len(leak_val)}, test_leaks={len(leak_test)}"
+        )
+
+    counts = df["split_group"].value_counts().to_dict()
+    counts.setdefault("train_in", 0)
+    counts.setdefault("val_ood", 0)
+    counts.setdefault("test_ood", 0)
+    return counts
+
+# --------------------------------------------------------------------------------------
+# Steps
+# --------------------------------------------------------------------------------------
 
 def step_clean(
-    train_in: Path = TRAIN_IN_RAW,
-    test_in: Path = TEST_IN_RAW,
-    train_out: Path = TRAIN_OUT_CLEAN,
-    test_out: Path = TEST_OUT_CLEAN,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    print(f"[read]  train: {train_in}")
-    print(f"[read]  test : {test_in}")
-    train = pd.read_parquet(train_in)
-    test = pd.read_parquet(test_in)
+    raw_train_in: Path = RAW_TRAIN_IN,
+    clean_out: Path = CLEAN_OUT,
+) -> pd.DataFrame:
+    print(f"[read]  raw train: {raw_train_in}")
+    train = pd.read_parquet(raw_train_in)
 
-    train_c = process_smiles(train)
-    test_c = process_smiles(test)
-
-    # audit
-    n_train_bad = train_c["smiles_clean"].isna().sum()
-    n_test_bad = test_c["smiles_clean"].isna().sum()
-    print(f"[train] rows={len(train_c)}  invalid_smiles={n_train_bad}")
-    print(f"[test ] rows={len(test_c)}   invalid_smiles={n_test_bad}")
+    train_c = process_smiles_column(train)
+    n_bad = train_c["smiles_clean"].isna().sum()
+    print(f"[clean] rows={len(train_c)}  invalid_smiles={n_bad}")
 
     diffs = (
-        train_c.assign(orig=train["molecule_smiles"])  # align original
+        train_c.assign(orig=train["molecule_smiles"])
         .loc[lambda d: d["smiles_clean"].ne(d["orig"])].head(5)
     )
     if not diffs.empty:
@@ -135,232 +267,164 @@ def step_clean(
         print(diffs[["orig", "smiles_clean"]].to_string(index=False))
         print()
 
-    # write
-    train_c.to_parquet(train_out, index=False)
-    test_c.to_parquet(test_out, index=False)
-    print(f"[write] {train_out}")
-    print(f"[write] {test_out}")
-    return train_c, test_c
+    train_c.to_parquet(clean_out, index=False)
+    print(f"[write] {clean_out}")
+    return train_c
 
 
-# --------------------------------------------------------------------------------------
-# Steps 2-4: canonicalize blocks; shared flags; OOD split by held-out blocks
-# --------------------------------------------------------------------------------------
-
-def ensure_block_clean_cols(df: pd.DataFrame, bb_cols: Iterable[str] = BB_COLS) -> pd.DataFrame:
-    out = df.copy()
-    for c in bb_cols:
-        cc = f"{c}_clean"
-        if cc not in out.columns:
-            out[cc] = out[c].astype(str).map(canon_block) if c in out.columns else None
-    return out
-
-
-def add_shared_block_flag(train: pd.DataFrame, test: pd.DataFrame, bb_cols: Iterable[str] = BB_COLS) -> pd.DataFrame:
-    train = ensure_block_clean_cols(train, bb_cols)
-    test = ensure_block_clean_cols(test, bb_cols)
-
-    test_blocks: set[str] = set()
-    for c in bb_cols:
-        cc = f"{c}_clean"
-        if cc in test.columns:
-            test_blocks |= set(pd.Series(test[cc]).dropna().unique().tolist())
-
-    def any_shared_blocks(row: pd.Series) -> bool:
-        return any((row.get(f"{c}_clean") in test_blocks) for c in bb_cols)
-
-    train = train.copy()
-    train["shared_block_any"] = train.apply(any_shared_blocks, axis=1)
-    return train
-
-
-def make_ood_split(
-    train: pd.DataFrame,
-    held_out_pct: float = 0.05,
-    seed: int = 42,
-    bb_cols: Iterable[str] = BB_COLS,
-) -> tuple[pd.DataFrame, list[str]]:
-    train = ensure_block_clean_cols(train, bb_cols)
-    bb_clean = [f"{c}_clean" for c in bb_cols]
-
-    # Universe of unique blocks from TRAIN ONLY
-    blocks_set = set().union(*[set(pd.Series(train[cc]).dropna().unique()) for cc in bb_clean])
-    blocks = np.array(sorted(list(blocks_set)))
-
-    if len(blocks) == 0:
-        raise ValueError("No building blocks found to create an OOD split.")
-
-    rng = np.random.default_rng(seed)
-    k = max(1, int(round(held_out_pct * len(blocks))))
-    held_out = set(rng.choice(blocks, size=k, replace=False))
-
-    def any_held_out(row: pd.Series) -> bool:
-        return any((row.get(cc) in held_out) for cc in bb_clean)
-
-    train = train.copy()
-    train["split_group"] = np.where(train.apply(any_held_out, axis=1), "val_ood", "train_in")
-    return train, sorted(list(held_out))
-
-
-# --------------------------------------------------------------------------------------
-# Step 5: persist block-cleaned data + metadata
-# --------------------------------------------------------------------------------------
-
-def persist_blocks_and_meta(
-    train: pd.DataFrame,
-    test: pd.DataFrame,
-    held_out_blocks: list[str],
-    train_out: Path = TRAIN_OUT_BLOCKS,
-    test_out: Path = TEST_OUT_BLOCKS,
+def step_split(
+    cleaned_in: Path = CLEAN_OUT,
+    all_out: Path = BLOCKS_ALL_OUT,
+    train_out: Path = BLOCKS_TR_OUT,
+    val_out: Path = BLOCKS_VA_OUT,
+    test_out: Path = BLOCKS_TE_OUT,
     meta_out: Path = META_OUT,
-    source_train: Path = TRAIN_OUT_CLEAN,
-    source_test: Path = TEST_OUT_CLEAN,
-    held_out_pct: float = 0.05,
+    val_pct: float = 0.08,
+    test_pct: float = 0.08,
     seed: int = 42,
 ) -> None:
-    train.to_parquet(train_out, index=False)
-    test.to_parquet(test_out, index=False)
+    print(f"[read] cleaned: {cleaned_in}")
+    df = pd.read_parquet(cleaned_in)
 
+    # Ensure *_clean block columns exist
+    df = ensure_block_clean_cols(df, BB_COLS)
+
+    # Build block partitions
+    blocks = collect_unique_blocks(df, BB_COLS)
+    print(f"[blocks] unique cleaned blocks in TRAIN: {len(blocks)}")
+
+    train_blocks, val_blocks, test_blocks = sample_block_partitions(
+        blocks=blocks, val_pct=val_pct, test_pct=test_pct, seed=seed
+    )
+    print(f"[partition] #train_blocks={len(train_blocks)} "
+          f"#val_blocks={len(val_blocks)} #test_blocks={len(test_blocks)}")
+
+    # Assign split groups; precedence test > val > train
+    df_split = assign_split_groups(df, val_blocks, test_blocks, BB_COLS)
+
+    # Sanity checks + counts
+    counts = sanity_checks_split(df_split, train_blocks, val_blocks, test_blocks, BB_COLS)
+    print("[counts] train_in={train_in}  val_ood={val_ood}  test_ood={test_ood}".format(**counts))
+
+    # Persist all rows + per-split convenience files
+    df_split.to_parquet(all_out, index=False)
+    df_split.loc[df_split["split_group"] == "train_in"].to_parquet(train_out, index=False)
+    df_split.loc[df_split["split_group"] == "val_ood"].to_parquet(val_out, index=False)
+    df_split.loc[df_split["split_group"] == "test_ood"].to_parquet(test_out, index=False)
+
+    # Metadata
     meta = {
         "bb_clean_cols": [f"{c}_clean" for c in BB_COLS],
         "split_col": "split_group",
-        "held_out_blocks": list(held_out_blocks),
-        "held_out_pct": float(held_out_pct),
-        "rng_seed": int(seed),
-        "source_train": str(source_train.resolve()),
-        "source_test": str(source_test.resolve()),
+        "seed": int(seed),
+        "val_pct": float(val_pct),
+        "test_pct": float(test_pct),
+        "block_partitions": {
+            "train_blocks": sorted(list(train_blocks)),
+            "val_blocks": sorted(list(val_blocks)),
+            "test_blocks": sorted(list(test_blocks)),
+        },
+        "source_cleaned": str(Path(cleaned_in).resolve()),
         "outputs": {
+            "all_rows": str(Path(all_out).resolve()),
             "train": str(Path(train_out).resolve()),
+            "val": str(Path(val_out).resolve()),
             "test": str(Path(test_out).resolve()),
         },
     }
     joblib.dump(meta, meta_out)
 
-    print("[write]", Path(train_out).name)
-    print("[write]", Path(test_out).name)
-    print("[write]", Path(meta_out).name)
-
-    # quick confirmation
-    req_cols = set(["split_group"] + meta["bb_clean_cols"])
-    print("\n[check] columns present in train:", req_cols.issubset(set(train.columns)))
-    print("[check] split_group counts:\n", train["split_group"].value_counts())
-
+    print(f"[write] {all_out.name}")
+    print(f"[write] {train_out.name}")
+    print(f"[write] {val_out.name}")
+    print(f"[write] {test_out.name}")
+    print(f"[write] {meta_out.name}")
 
 # --------------------------------------------------------------------------------------
 # Orchestrators
 # --------------------------------------------------------------------------------------
 
-def run_clean(args: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFrame]:
-    return step_clean(
-        train_in=Path(args.train_in or TRAIN_IN_RAW),
-        test_in=Path(args.test_in or TEST_IN_RAW),
-        train_out=Path(args.train_out or TRAIN_OUT_CLEAN),
-        test_out=Path(args.test_out or TEST_OUT_CLEAN),
+def run_clean(args: argparse.Namespace) -> None:
+    step_clean(
+        raw_train_in=Path(args.raw_train_in or RAW_TRAIN_IN),
+        clean_out=Path(args.clean_out or CLEAN_OUT),
     )
 
 
-def run_blocks(args: argparse.Namespace) -> None:
-    # read cleaned files (can also accept overrides)
-    train = pd.read_parquet(Path(args.train_in or TRAIN_OUT_CLEAN))
-    test = pd.read_parquet(Path(args.test_in or TEST_OUT_CLEAN))
-
-    # 2) ensure *_clean block columns
-    train = ensure_block_clean_cols(train)
-    test = ensure_block_clean_cols(test)
-
-    # 3) shared flag
-    train = add_shared_block_flag(train, test)
-
-    # 4) OOD split
-    train, held_out = make_ood_split(train, held_out_pct=args.held_out_pct, seed=args.seed)
-
-    # 5) persist
-    persist_blocks_and_meta(
-        train,
-        test,
-        held_out,
-        train_out=Path(args.train_out or TRAIN_OUT_BLOCKS),
-        test_out=Path(args.test_out or TEST_OUT_BLOCKS),
+def run_split(args: argparse.Namespace) -> None:
+    step_split(
+        cleaned_in=Path(args.cleaned_in or CLEAN_OUT),
+        all_out=Path(args.all_out or BLOCKS_ALL_OUT),
+        train_out=Path(args.train_out or BLOCKS_TR_OUT),
+        val_out=Path(args.val_out or BLOCKS_VA_OUT),
+        test_out=Path(args.test_out or BLOCKS_TE_OUT),
         meta_out=Path(args.meta_out or META_OUT),
-        source_train=Path(args.source_train or TRAIN_OUT_CLEAN),
-        source_test=Path(args.source_test or TEST_OUT_CLEAN),
-        held_out_pct=args.held_out_pct,
+        val_pct=args.val_pct,
+        test_pct=args.test_pct,
         seed=args.seed,
     )
 
 
 def run_all(args: argparse.Namespace) -> None:
     # Step 1
-    train_c, test_c = step_clean(
-        train_in=Path(args.raw_train_in or TRAIN_IN_RAW),
-        test_in=Path(args.raw_test_in or TEST_IN_RAW),
-        train_out=Path(args.clean_train_out or TRAIN_OUT_CLEAN),
-        test_out=Path(args.clean_test_out or TEST_OUT_CLEAN),
+    step_clean(
+        raw_train_in=Path(args.raw_train_in or RAW_TRAIN_IN),
+        clean_out=Path(args.clean_out or CLEAN_OUT),
     )
-
-    # Steps 2-5
-    train_c = ensure_block_clean_cols(train_c)
-    test_c = ensure_block_clean_cols(test_c)
-    train_c = add_shared_block_flag(train_c, test_c)
-    train_c, held_out = make_ood_split(train_c, held_out_pct=args.held_out_pct, seed=args.seed)
-
-    persist_blocks_and_meta(
-        train_c,
-        test_c,
-        held_out,
-        train_out=Path(args.blocks_train_out or TRAIN_OUT_BLOCKS),
-        test_out=Path(args.blocks_test_out or TEST_OUT_BLOCKS),
+    # Step 2-4
+    step_split(
+        cleaned_in=Path(args.cleaned_in or args.clean_out or CLEAN_OUT),
+        all_out=Path(args.all_out or BLOCKS_ALL_OUT),
+        train_out=Path(args.train_out or BLOCKS_TR_OUT),
+        val_out=Path(args.val_out or BLOCKS_VA_OUT),
+        test_out=Path(args.test_out or BLOCKS_TE_OUT),
         meta_out=Path(args.meta_out or META_OUT),
-        source_train=Path(args.clean_train_out or TRAIN_OUT_CLEAN),
-        source_test=Path(args.clean_test_out or TEST_OUT_CLEAN),
-        held_out_pct=args.held_out_pct,
+        val_pct=args.val_pct,
+        test_pct=args.test_pct,
         seed=args.seed,
     )
-
 
 # --------------------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------------------
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Chemistry preprocessing + block-based OOD pipeline")
+    p = argparse.ArgumentParser(description="Chemistry preprocessing + block-based OOD split (train-only)")
+
     sub = p.add_subparsers(dest="cmd", required=True)
 
     # clean
-    pc = sub.add_parser("clean", help="Clean DEL SMILES and write *_clean.parquet files")
-    pc.add_argument("--train-in", dest="train_in", default=None, help="Path to raw train parquet")
-    pc.add_argument("--test-in", dest="test_in", default=None, help="Path to raw test parquet")
-    pc.add_argument("--train-out", dest="train_out", default=None, help="Output cleaned train parquet")
-    pc.add_argument("--test-out", dest="test_out", default=None, help="Output cleaned test parquet")
+    pc = sub.add_parser("clean", help="Clean SMILES from Kaggle train and write *_clean.parquet")
+    pc.add_argument("--raw-train-in", dest="raw_train_in", default=None, help="Raw Kaggle train parquet path")
+    pc.add_argument("--clean-out", dest="clean_out", default=None, help="Output cleaned train parquet")
     pc.set_defaults(func=run_clean)
 
-    # blocks
-    pb = sub.add_parser("blocks", help="Canonicalize block cols, flag shared, create OOD split, persist + metadata")
-    pb.add_argument("--train-in", dest="train_in", default=None, help="Input cleaned train parquet")
-    pb.add_argument("--test-in", dest="test_in", default=None, help="Input cleaned test parquet")
-    pb.add_argument("--train-out", dest="train_out", default=None, help="Output blocks train parquet")
-    pb.add_argument("--test-out", dest="test_out", default=None, help="Output blocks test parquet")
-    pb.add_argument("--meta-out", dest="meta_out", default=None, help="Output joblib metadata path")
-    pb.add_argument("--source-train", dest="source_train", default=None, help="Path recorded in metadata: cleaned train source")
-    pb.add_argument("--source-test", dest="source_test", default=None, help="Path recorded in metadata: cleaned test source")
-    pb.add_argument("--held-out-pct", type=float, default=0.05, help="Pct of TRAIN blocks held-out to val_ood [0-1]")
-    pb.add_argument("--seed", type=int, default=42, help="Random seed for held-out selection")
-    pb.set_defaults(func=run_blocks)
+    # split
+    ps = sub.add_parser("split", help="Create OOD split by holding out blocks into val/test; write blocks+metadata")
+    ps.add_argument("--cleaned-in", dest="cleaned_in", default=None, help="Input cleaned train parquet")
+    ps.add_argument("--all-out", dest="all_out", default=None, help="Output parquet with all rows + split_group")
+    ps.add_argument("--train-out", dest="train_out", default=None, help="Output parquet for train_in")
+    ps.add_argument("--val-out", dest="val_out", default=None, help="Output parquet for val_ood")
+    ps.add_argument("--test-out", dest="test_out", default=None, help="Output parquet for test_ood")
+    ps.add_argument("--meta-out", dest="meta_out", default=None, help="Output joblib metadata path")
+    ps.add_argument("--val-pct", type=float, default=0.08, help="Fraction of blocks held out to VAL OOD (0,1)")
+    ps.add_argument("--test-pct", type=float, default=0.08, help="Fraction of blocks held out to TEST OOD (0,1)")
+    ps.add_argument("--seed", type=int, default=42, help="Random seed for block partitioning")
+    ps.set_defaults(func=run_split)
 
     # all
-    pa = sub.add_parser("all", help="Run clean + blocks in sequence and write all outputs")
-    # raw inputs for step 1
-    pa.add_argument("--raw-train-in", dest="raw_train_in", default=None, help="Raw train parquet path")
-    pa.add_argument("--raw-test-in", dest="raw_test_in", default=None, help="Raw test parquet path")
-    # cleaned outputs (and sources recorded by metadata)
-    pa.add_argument("--clean-train-out", dest="clean_train_out", default=None, help="Output cleaned train parquet")
-    pa.add_argument("--clean-test-out", dest="clean_test_out", default=None, help="Output cleaned test parquet")
-    # final blocks outputs
-    pa.add_argument("--blocks-train-out", dest="blocks_train_out", default=None, help="Output blocks train parquet")
-    pa.add_argument("--blocks-test-out", dest="blocks_test_out", default=None, help="Output blocks test parquet")
+    pa = sub.add_parser("all", help="Run clean + split in sequence and write all outputs")
+    pa.add_argument("--raw-train-in", dest="raw_train_in", default=None, help="Raw Kaggle train parquet path")
+    pa.add_argument("--clean-out", dest="clean_out", default=None, help="Output cleaned train parquet")
+    pa.add_argument("--cleaned-in", dest="cleaned_in", default=None, help="Input cleaned train parquet (if skipping clean)")
+    pa.add_argument("--all-out", dest="all_out", default=None, help="Output parquet with all rows + split_group")
+    pa.add_argument("--train-out", dest="train_out", default=None, help="Output parquet for train_in")
+    pa.add_argument("--val-out", dest="val_out", default=None, help="Output parquet for val_ood")
+    pa.add_argument("--test-out", dest="test_out", default=None, help="Output parquet for test_ood")
     pa.add_argument("--meta-out", dest="meta_out", default=None, help="Output joblib metadata path")
-    pa.add_argument("--held-out-pct", type=float, default=0.05, help="Pct of TRAIN blocks held-out to val_ood [0-1]")
-    pa.add_argument("--seed", type=int, default=42, help="Random seed for held-out selection")
+    pa.add_argument("--val-pct", type=float, default=0.08, help="Fraction of blocks held out to VAL OOD (0,1)")
+    pa.add_argument("--test-pct", type=float, default=0.08, help="Fraction of blocks held out to TEST OOD (0,1)")
+    pa.add_argument("--seed", type=int, default=42, help="Random seed for block partitioning")
     pa.set_defaults(func=run_all)
 
     return p
@@ -374,4 +438,5 @@ def main(argv: Optional[list[str]] = None) -> None:
 
 if __name__ == "__main__":
     main()
+
 
