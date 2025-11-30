@@ -101,7 +101,7 @@ print("scale_pos_weight (train_in):", scale_pos_weight)
 xgb_clf = xgb.XGBClassifier(
     objective="binary:logistic",
     tree_method="hist",
-    n_estimators=250,
+    n_estimators=1000,
     learning_rate=0.05,
     max_depth=7,
     subsample=0.8,
@@ -138,7 +138,7 @@ print("Combined TRAIN (train_in + val_ood) shape:",
 xgb_final = xgb.XGBClassifier(
     objective="binary:logistic",
     tree_method="hist",
-    n_estimators=500,
+    n_estimators=1000,
     learning_rate=0.05,
     max_depth=7,
     subsample=0.8,
