@@ -102,6 +102,7 @@ dependencies:
   - pip:
       # Deep learning (CPU wheels)
       - torch>=2.2
+      - torch-geometric==2.5.3
       - torchvision
       - torchaudio
       # Viz/export & notebook helpers

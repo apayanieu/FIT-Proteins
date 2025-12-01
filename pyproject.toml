@@ -54,6 +54,7 @@ dl = [
   "torchmetrics>=1.4",
   "captum>=0.7",
   "torchviz>=0.0.2",
+  "torch-geometric==2.5.3"
 ]
 
 # Viz stacks
