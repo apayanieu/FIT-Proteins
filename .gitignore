@@ -32,3 +32,11 @@ dist/
 /results/
 /logs/
 
+data/processed/
+results/
+*.pt
+*.npz
+*.joblib
+*.ckpt
+*.pth
+.DS_Store

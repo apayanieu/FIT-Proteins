@@ -16,7 +16,7 @@ which creates:
 This script:
 
   - loads those graph lists
-  - builds a GNN with virtual node + GINEConv + sum+mean pooling
+  - builds a GNN with virtual node + GINEConv + sum pooling
   - trains on train_in, selects best epoch on val_ood (by AP)
   - reports AP / ROC-AUC on test_ood
   - saves best model + a text summary
@@ -26,13 +26,12 @@ CLI example:
   python src/fit_proteins/models/gnn_pyg.py train_gnn \
       --data-dir data/processed \
       --results-dir results/gnn_results \
-      --epochs 30 \
-      --batch-size 128
+      --epochs 35 \
+      --batch-size 256
 """
 
 import argparse
 import math
-import os
 import random
 from pathlib import Path
 from typing import Tuple, List
@@ -45,7 +44,7 @@ import torch.nn.functional as F
 from sklearn.metrics import average_precision_score, roc_auc_score
 from torch_geometric.data import Data
 from torch_geometric.loader import DataLoader
-from torch_geometric.nn import GINEConv, global_add_pool, global_mean_pool
+from torch_geometric.nn import GINEConv, global_add_pool
 
 
 # --------------------------------------------------------------------------------------
@@ -99,7 +98,7 @@ class GNNWithVirtualNode(nn.Module):
       - linear encoders for node & edge features
       - stack of GINEConv layers
       - virtual node updated after each layer (except last)
-      - sum + mean global pooling
+      - sum global pooling
       - MLP head -> single logit
     """
 
@@ -151,9 +150,9 @@ class GNNWithVirtualNode(nn.Module):
                 )
             )
 
-        # final prediction head on [sum_pool, mean_pool]
+        # final prediction head on sum pooling
         self.mlp_head = nn.Sequential(
-            nn.Linear(2 * hidden_dim, hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, 1),
@@ -195,67 +194,11 @@ class GNNWithVirtualNode(nn.Module):
                 pooled = global_add_pool(h, batch)  # [num_graphs, hidden_dim]
                 virtualnode_emb = virtualnode_emb + self.mlp_virtual_list[layer](pooled)
 
-        # global pooling
-        h_sum = global_add_pool(h, batch)
-        h_mean = global_mean_pool(h, batch)
-        hg = torch.cat([h_sum, h_mean], dim=1)
+        # global sum pooling
+        hg = global_add_pool(h, batch)
 
         logits = self.mlp_head(hg).squeeze(1)  # [num_graphs]
         return logits
-
-
-# --------------------------------------------------------------------------------------
-# Focal loss with fixed alpha
-# --------------------------------------------------------------------------------------
-
-class FocalLossFixedAlpha(nn.Module):
-    """
-    Focal loss with fixed α for the positive class.
-
-    For binary classification:
-
-      L = - α_t (1 - p_t)^γ log(p_t)
-
-      where:
-        p = sigmoid(logit)
-        p_t = p      if y=1
-              1 - p  if y=0
-
-      α_t = alpha_pos    if y=1
-            alpha_neg    if y=0
-      with alpha_neg = 1 - alpha_pos
-    """
-
-    def __init__(self, alpha_pos: float = 0.99, gamma: float = 1.5, eps: float = 1e-6):
-        super().__init__()
-        if not (0.0 < alpha_pos < 1.0):
-            raise ValueError("alpha_pos must be in (0, 1).")
-        self.alpha_pos = float(alpha_pos)
-        self.alpha_neg = 1.0 - float(alpha_pos)
-        self.gamma = gamma
-        self.eps = eps
-
-    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        """
-        logits: [B] raw scores
-        targets: [B] in {0,1}
-        """
-        targets = targets.float()
-        probs = torch.sigmoid(logits)
-        probs = probs.clamp(min=self.eps, max=1.0 - self.eps)
-
-        # α_t per sample
-        alpha = torch.where(
-            targets > 0.5,
-            torch.full_like(targets, self.alpha_pos),
-            torch.full_like(targets, self.alpha_neg),
-        )
-
-        # p_t
-        pt = torch.where(targets > 0.5, probs, 1.0 - probs)
-
-        loss = -alpha * torch.pow(1.0 - pt, self.gamma) * torch.log(pt)
-        return loss.mean()
 
 
 # --------------------------------------------------------------------------------------
@@ -358,11 +301,17 @@ def run_train_gnn(args: argparse.Namespace) -> None:
         f"edge_in_dim={edge_in_dim}"
     )
 
-    print(
-        f"[loss] focal alpha_pos={args.alpha_pos:.3f}  "
-        f"alpha_neg={1.0 - args.alpha_pos:.3f}  "
-        f"gamma={args.gamma:.2f}"
-    )
+    # --- BCEWithLogits with class weighting ---
+    n_pos = train_stats.get("n_pos", None)
+    n_neg = train_stats.get("n_neg", None)
+    if n_pos is not None and n_neg is not None and n_pos > 0:
+        pos_weight_value = float(n_neg) / float(n_pos)
+    else:
+        pos_weight_value = 1.0
+
+    print(f"[loss] BCEWithLogits pos_weight={pos_weight_value:.3f}")
+
+    pos_weight = torch.tensor([pos_weight_value], device=device)
 
     # --- DataLoaders ---
     train_loader = DataLoader(
@@ -393,10 +342,7 @@ def run_train_gnn(args: argparse.Namespace) -> None:
         dropout=args.dropout,
     ).to(device)
 
-    criterion = FocalLossFixedAlpha(
-        alpha_pos=args.alpha_pos,
-        gamma=args.gamma,
-    )
+    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
     optimizer = torch.optim.Adam(
         model.parameters(),
@@ -404,7 +350,8 @@ def run_train_gnn(args: argparse.Namespace) -> None:
         weight_decay=args.weight_decay,
     )
 
-    best_val_ap = 0.0
+    best_val_ap = -1.0
+    best_val_roc_at_best_ap = float("nan")
     best_epoch = 0
     best_model_path = results_dir / "gnn_pyg_best.pt"
 
@@ -421,7 +368,7 @@ def run_train_gnn(args: argparse.Namespace) -> None:
             logits = model(batch)
             targets = batch.y.view(-1)
 
-            loss = criterion(logits, targets)
+            loss = criterion(logits, targets.float())
             loss.backward()
             optimizer.step()
 
@@ -441,8 +388,9 @@ def run_train_gnn(args: argparse.Namespace) -> None:
         )
 
         # Track best model by val AP
-        if val_ap > best_val_ap:
+        if not math.isnan(val_ap) and val_ap > best_val_ap:
             best_val_ap = val_ap
+            best_val_roc_at_best_ap = val_roc
             best_epoch = epoch
             torch.save(
                 {
@@ -461,7 +409,10 @@ def run_train_gnn(args: argparse.Namespace) -> None:
             )
             print(f"  -> new best model saved to {best_model_path}")
 
-    print(f"Training finished. Best val_AP={best_val_ap:.4f} at epoch {best_epoch}")
+    print(
+        f"Training finished. Best val_AP={best_val_ap:.4f} "
+        f"(val_ROC={best_val_roc_at_best_ap:.4f}) at epoch {best_epoch}"
+    )
 
     # --- Final test evaluation using best model ---
     if best_model_path.exists():
@@ -476,17 +427,20 @@ def run_train_gnn(args: argparse.Namespace) -> None:
     with open(log_path, "w") as f:
         f.write(f"Best epoch: {best_epoch}\n")
         f.write(f"Best val_AP: {best_val_ap:.6f}\n")
+        f.write(f"Best val_ROC_AUC_at_best_AP: {best_val_roc_at_best_ap:.6f}\n")
         f.write(f"Test_AP: {test_ap:.6f}\n")
         f.write(f"Test_ROC_AUC: {test_roc:.6f}\n")
         f.write(f"Train_pos_rate: {train_stats.get('pos_rate', float('nan')):.6f}\n")
         f.write(f"Val_pos_rate: {val_stats.get('pos_rate', float('nan')):.6f}\n")
         f.write(f"Test_pos_rate: {test_stats.get('pos_rate', float('nan')):.6f}\n")
-        f.write(f"alpha_pos: {args.alpha_pos:.6f}\n")
-        f.write(f"alpha_neg: {1.0 - args.alpha_pos:.6f}\n")
-        f.write(f"gamma: {args.gamma:.6f}\n")
+        f.write(f"pos_weight: {pos_weight_value:.6f}\n")
         f.write(f"hidden_dim: {args.hidden_dim}\n")
         f.write(f"num_layers: {args.num_layers}\n")
         f.write(f"dropout: {args.dropout}\n")
+        f.write(f"lr: {args.lr}\n")
+        f.write(f"weight_decay: {args.weight_decay}\n")
+        f.write(f"batch_size: {args.batch_size}\n")
+        f.write(f"epochs: {args.epochs}\n")
 
     print(f"[write] summary -> {log_path}")
     print("=== DONE GNN-PyG TRAINING ===")
@@ -513,25 +467,13 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Directory to store model & logs (default: results/gnn_results)",
     )
-    pt.add_argument("--epochs", type=int, default=30)
-    pt.add_argument("--batch-size", type=int, default=128)
+    pt.add_argument("--epochs", type=int, default=35)
+    pt.add_argument("--batch-size", type=int, default=256)
     pt.add_argument("--lr", type=float, default=1e-3)
-    pt.add_argument("--weight-decay", type=float, default=0.0)
+    pt.add_argument("--weight-decay", type=float, default=1e-4)
     pt.add_argument("--hidden-dim", type=int, default=128)
     pt.add_argument("--num-layers", type=int, default=4)
     pt.add_argument("--dropout", type=float, default=0.2)
-    pt.add_argument(
-        "--gamma",
-        type=float,
-        default=1.5,
-        help="Focal loss gamma (default 1.5)",
-    )
-    pt.add_argument(
-        "--alpha-pos",
-        type=float,
-        default=0.99,
-        help="Focal loss α for positive class; negative gets 1-α (default 0.99)",
-    )
     pt.add_argument("--seed", type=int, default=42)
     pt.add_argument("--num-workers", type=int, default=0)
     pt.add_argument(
