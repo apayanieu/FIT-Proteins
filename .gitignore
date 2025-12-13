@@ -29,14 +29,14 @@ dist/
 
 # --- Logs / outputs (TOP-LEVEL ONLY) ---
 /outputs/
-/results/
 /logs/
 
+# --- Data (keep raw, ignore processed) ---
 data/processed/
-results/
+
+# --- Large model / binary artefacts (but keep CSV + TXT in results/) ---
 *.pt
 *.npz
 *.joblib
 *.ckpt
 *.pth
-.DS_Store
