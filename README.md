@@ -12,12 +12,6 @@ The core focus is **learning under extreme class imbalance** and **out-of-distri
 **Goal:**  
 Given a molecule (as SMILES or a molecular graph), predict whether it binds to **BRD4**.
 
-**Key challenges:**
-
-- Very low active rate (~0.5% positives).
-- Library artefacts (e.g. linker token) that can leak into models.
-- Need to generalize to **new chemical blocks**, not just random splits.
-
 **What this project implements:**
 
 - Chemistry preprocessing:
@@ -47,7 +41,7 @@ Given a molecule (as SMILES or a molecular graph), predict whether it binds to *
 ```text
 .
 ├── LICENSE
-├── README.md              # You are here
+├── README.md              
 ├── environment.yml        # Conda environment (recommended)
 ├── pyproject.toml         # Package metadata & dependencies
 ├── data
@@ -307,7 +301,6 @@ The notebooks under `notebooks/` are for exploration and report figures, not the
   * Barplots comparing RF / XGB / CNN / GNN on OOD AP & ROC-AUC.
   * Optional precision–recall curves for a chosen model.
 
-These figures are designed to drop directly into the final report.
 
 ---
 
@@ -326,14 +319,6 @@ Reasonable next steps:
 * Add post-hoc calibration and cost-sensitive threshold selection.
 * Explore transformer models on SMILES or graphs.
 * Compare block-based OOD splitting against scaffold-based or UMAP-based clustering splits.
-* Incorporate uncertainty estimates and simple active-learning loops.
-
----
-
-## License
-
-This project is licensed under the **MIT License**.
-See [`LICENSE`](LICENSE) for details.
 
 ---
 
@@ -343,33 +328,3 @@ See [`LICENSE`](LICENSE) for details.
 * Dataset: BELKA BRD4 data from Kaggle (DNA-encoded library).
 * Libraries: NumPy, pandas, scikit-learn, XGBoost, PyTorch, PyTorch Geometric, RDKit, and others.
 
-```
-```
-```markdown
----
-
-## Citation
-
-If you use this repository or its components in your research, please cite:
-
-```
-@misc{fit_proteins2023,
-    author = {Your Name},
-    title = {F.I.T Proteins: Fast Inference of Therapeutic PROTEIN–Ligand Interactions for BRD4},
-    year = {2023},
-    url = {https://github.com/your-repo-url}
-}
-```
-
----
-
-## Support
-
-For questions, issues, or contributions, please open an issue on the [GitHub repository](https://github.com/your-repo-url) or contact the maintainers directly.
-
----
-
-## Contributing
-
-Contributions are welcome! If you have ideas for improvements or new features, please fork the repository, create a new branch, and submit a pull request. Make sure to follow the existing code style and include relevant tests where applicable.
-```
