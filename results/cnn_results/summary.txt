@@ -1,0 +1,10 @@
+Best epoch: 6
+Best val_AP: 0.394327
+Test_AP: 0.329424
+Test_ROC_AUC: 0.818159
+Train_pos_rate: 0.003418
+Val_pos_rate: 0.004128
+Test_pos_rate: 0.015165
+alpha_pos: 0.900000
+alpha_neg: 0.100000
+gamma: 2.000000

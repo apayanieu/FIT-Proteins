@@ -1,0 +1,16 @@
+Best epoch: 25
+Best val_AP: 0.179433
+Best val_ROC_AUC_at_best_AP: 0.865398
+Test_AP: 0.095883
+Test_ROC_AUC: 0.804770
+Train_pos_rate: 0.003418
+Val_pos_rate: 0.004128
+Test_pos_rate: 0.015165
+pos_weight: 1.000000
+hidden_dim: 128
+num_layers: 4
+dropout: 0.2
+lr: 0.001
+weight_decay: 0.0001
+batch_size: 256
+epochs: 35
