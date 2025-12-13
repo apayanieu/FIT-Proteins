@@ -328,3 +328,22 @@ Reasonable next steps:
 * Dataset: BELKA BRD4 data from Kaggle (DNA-encoded library).
 * Libraries: NumPy, pandas, scikit-learn, XGBoost, PyTorch, PyTorch Geometric, RDKit, and others.
 
+---
+
+## Use of AI tools
+
+This project made limited, documented use of AI-based assistants:
+
+- **ChatGPT (OpenAI GPT models)** was used to:
+  - brainstorm and refine the overall project structure,
+  - suggest refactorings and improvements to Python scripts,
+  - assist with organizing the contents and structure of this repository, including this README file.
+
+- **GitHub Copilot (GPT-based code completion)** was used inside the IDE to:
+  - suggest boilerplate code (argument parsers, training loops, logging),
+  - autocomplete repetitive PyTorch and scikit-learn patterns,
+  - speed up writing code.
+
+All core modeling decisions, data processing logic, and final code were **reviewed, adapted, and validated by the authors**.  
+
+
